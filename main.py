@@ -1,5 +1,5 @@
 """
-𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐁𝐎𝐓 𝐕𝐄𝐑𝐒𝐈𝐎𝐍 𝟒.𝟎 — 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐏𝐀𝐍𝐄𝐋
+𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐁𝐎𝐓 𝐕𝐄𝐑𝐒𝐈𝐎𝐍 𝟒.𝟏 — 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐏𝐀𝐍𝐄𝐋
 𝐂𝐘𝐁𝐄𝐑𝐏𝐔𝐍𝐊 + 𝐇𝐀𝐂𝐊𝐄𝐑 𝐓𝐄𝐑𝐌𝐈𝐍𝐀𝐋 + 𝐒𝐄𝐑𝐕𝐄𝐑 𝐑𝐀𝐂𝐊 𝐔𝐈
 """
 
@@ -7,17 +7,13 @@ import subprocess
 import sys
 import os
 
-# ✅ Auto-install missing modules
-def auto_install(package):
+# ✅ Packages pre-installed via Replit package manager (pip not available in Nix)
+_pkg_map = {"pyTelegramBotAPI": "telebot", "Pillow": "PIL", "dnspython": "dns"}
+for _mod in ["pyTelegramBotAPI", "psutil", "requests", "flask", "qrcode", "Pillow", "cryptography", "pymongo", "dnspython"]:
     try:
-        __import__(package.replace('-', '_').split('[')[0])
+        __import__(_pkg_map.get(_mod, _mod))
     except (ModuleNotFoundError, ImportError):
-        print(f"📦 Installing missing package: {package} ...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet", "--break-system-packages"])
-        print(f"✅ Installed: {package}")
-
-for mod in ["pyTelegramBotAPI", "psutil", "requests", "flask", "qrcode", "Pillow", "cryptography", "pymongo", "dnspython"]:
-    auto_install(mod)
+        print(f"⚠️ Missing: {_mod} — install via Replit package manager")
 
 # --- After auto-install, import all modules safely ---
 import telebot
@@ -68,21 +64,20 @@ def keep_alive():
 # ================================
 
 # ── TOKEN ──────────────────────────────────────────────────────────────────────
-# Option 1: Set BOT_TOKEN in Railway/Replit environment secrets (recommended)
+# Option 1: Set BOT_TOKEN in environment secrets (recommended)
 # Option 2: Paste your token directly below between the quotes
-BOT_TOKEN_HARDCODED = ''  # <- Paste token here if not using env var, e.g. '123456:ABC...'
+BOT_TOKEN_HARDCODED = ''  # <- Paste token here if not using env var
 
 TOKEN = os.environ.get('BOT_TOKEN', BOT_TOKEN_HARDCODED)
 
 # ── OWNER ID ────────────────────────────────────────────────────────────────────
-# Option 1: Set OWNER_ID in Railway/Replit environment secrets (recommended)
+# Option 1: Set OWNER_ID in environment secrets (recommended)
 # Option 2: Paste your Telegram user ID directly below
-OWNER_ID_HARDCODED = 0  # <- Paste your user ID here if not using env var, e.g. 123456789
+OWNER_ID_HARDCODED = 0  # <- Paste your Telegram user ID here
 
 OWNER_ID = int(os.environ.get('OWNER_ID', str(OWNER_ID_HARDCODED)))
 
 # ── MONGODB ─────────────────────────────────────────────────────────────────────
-# MongoDB connection string — set here or override with MONGODB_URI env var
 MONGODB_URI_DEFAULT = ''
 MONGODB_URI = os.environ.get('MONGODB_URI', MONGODB_URI_DEFAULT)
 
@@ -90,7 +85,6 @@ MONGODB_URI = os.environ.get('MONGODB_URI', MONGODB_URI_DEFAULT)
 if not TOKEN:
     print("❌ BOT_TOKEN not found!")
     print("👉 Set BOT_TOKEN in environment variables OR paste it in BOT_TOKEN_HARDCODED above.")
-    # Wait and retry instead of crashing immediately so Railway can inject env vars
     time.sleep(5)
     TOKEN = os.environ.get('BOT_TOKEN', BOT_TOKEN_HARDCODED)
     if not TOKEN:
@@ -126,33 +120,11 @@ bot = telebot.TeleBot(TOKEN, use_class_middlewares=True)
 
 from telebot.handler_backends import BaseMiddleware, CancelUpdate
 
-class OwnerOnlyMiddleware(BaseMiddleware):
-    def __init__(self):
-        super().__init__()
-        self.update_types = ['message', 'callback_query']
-
-    def pre_process(self, update, data):
-        user = getattr(update, 'from_user', None)
-        if user is None or (user.id != OWNER_ID and user.id not in active_users):
-            try:
-                if hasattr(update, 'text') or hasattr(update, 'document'):
-                    bot.reply_to(update, "🔒 𝐓𝐡𝐢𝐬 𝐛𝐨𝐭 𝐢𝐬 𝐩𝐫𝐢𝐯𝐚𝐭𝐞 𝐚𝐧𝐝 𝐥𝐨𝐜𝐤𝐞𝐝 𝐭𝐨 𝐢𝐭𝐬 𝐨𝐰𝐧𝐞𝐫 𝐨𝐧𝐥𝐲.")
-                else:
-                    bot.answer_callback_query(update.id, "🔒 𝐍𝐨𝐭 𝐚𝐮𝐭𝐡𝐨𝐫𝐢𝐳𝐞𝐝.", show_alert=True)
-            except Exception:
-                pass
-            return CancelUpdate()
-        return None
-
-    def post_process(self, update, data, exception=None):
-        pass
-
-# bot.setup_middleware(OwnerOnlyMiddleware())  # Disabled — everyone can use
-
 # --- Data structures ---
 bot_scripts = {}
 user_files = {}
-active_users = set()
+active_users = set()       # All users who have ever used the bot (for notifications)
+authorized_users = set()   # Users the admin has explicitly allowed
 admin_ids = {OWNER_ID}
 user_subscriptions = {}
 bot_locked = False
@@ -161,6 +133,43 @@ bot_locked = False
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ================================
+# 𝐀𝐂𝐂𝐄𝐒𝐒 𝐂𝐎𝐍𝐓𝐑𝐎𝐋 𝐌𝐈𝐃𝐃𝐋𝐄𝐖𝐀𝐑𝐄
+# ================================
+class AdminOnlyMiddleware(BaseMiddleware):
+    """Only owner + explicitly authorized users can use this bot."""
+    def __init__(self):
+        super().__init__()
+        self.update_types = ['message', 'callback_query']
+
+    def pre_process(self, update, data):
+        user = getattr(update, 'from_user', None)
+        if user is None:
+            return CancelUpdate()
+        uid = user.id
+        # Allow owner always
+        if uid == OWNER_ID:
+            return None
+        # Allow explicitly authorized users
+        if uid in authorized_users:
+            return None
+        # Block everyone else
+        try:
+            if hasattr(update, 'message') or hasattr(update, 'text') or hasattr(update, 'document'):
+                bot.reply_to(update, "🔒 *Access Denied*\n\nThis bot is private. Contact the admin to get access.", parse_mode='Markdown')
+            else:
+                bot.answer_callback_query(update.id, "🔒 Access Denied. Contact admin.", show_alert=True)
+        except Exception:
+            pass
+        return CancelUpdate()
+
+    def post_process(self, update, data, exception=None):
+        pass
+
+bot.setup_middleware(AdminOnlyMiddleware())
+
 
 # ================================
 # 𝐅𝐎𝐍𝐓 𝐂𝐎𝐍𝐕𝐄𝐑𝐒𝐈𝐎𝐍 𝐅𝐔𝐍𝐂𝐓𝐈𝐎𝐍𝐒
@@ -355,7 +364,6 @@ class AnimationManager:
 
     @staticmethod
     def animate_recovery(chat_id, message_id):
-        """Server recovery animation"""
         frames = [
             "╔══════════════════════════════════╗\n║  🛰 𝐒𝐄𝐑𝐕𝐄𝐑 𝐑𝐄𝐂𝐎𝐕𝐄𝐑𝐘 𝐒𝐘𝐒𝐓𝐄𝐌      ║\n╚══════════════════════════════════╝\n\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟏   🟢\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟐   🟢\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟑   🟡\n\n> 𝐑𝐞𝐜𝐨𝐯𝐞𝐫𝐢𝐧𝐠...",
             "╔══════════════════════════════════╗\n║  ✅ 𝐑𝐄𝐂𝐎𝐕𝐄𝐑𝐘 𝐂𝐎𝐌𝐏𝐋𝐄𝐓𝐄           ║\n╚══════════════════════════════════╝\n\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟏   🟢\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟐   🟢\n🖥 𝐒𝐞𝐫𝐯𝐞𝐫 𝟑   🟢\n\n𝐑𝐞𝐜𝐨𝐯𝐞𝐫𝐲 𝐂𝐨𝐦𝐩𝐥𝐞𝐭𝐞 ✅"
@@ -404,7 +412,7 @@ class AutoRecoverySystem:
     def __init__(self):
         self.running_scripts_file = RUNNING_SCRIPTS_DB
 
-    def save_running_script(self, user_id: int, file_name: str, file_path: str, process_pid: int):
+    def save_running_script(self, user_id: int, file_name: str, file_path: str, process_pid: int, run_dir: str = None):
         try:
             if os.path.exists(self.running_scripts_file):
                 with open(self.running_scripts_file, 'r') as f:
@@ -416,7 +424,8 @@ class AutoRecoverySystem:
             data["running_scripts"].append({
                 "user_id": user_id, "file_name": file_name, "file_path": file_path,
                 "process_pid": process_pid, "start_time": datetime.now().isoformat(),
-                "status": "running", "last_updated": datetime.now().isoformat()
+                "status": "running", "last_updated": datetime.now().isoformat(),
+                "run_dir": run_dir or os.path.dirname(file_path)
             })
             with open(self.running_scripts_file, 'w') as f:
                 json.dump(data, f, indent=4)
@@ -447,6 +456,7 @@ class AutoRecoverySystem:
                     user_id = script["user_id"]
                     file_name = script["file_name"]
                     file_path = script["file_path"]
+                    run_dir = script.get("run_dir", os.path.dirname(file_path))
                     if not os.path.exists(file_path):
                         continue
                     user_has_file = any(fname == file_name for fname, _ in user_files.get(user_id, []))
@@ -455,14 +465,17 @@ class AutoRecoverySystem:
                     tier = get_user_tier(user_id)
                     if not TIER_SYSTEM[tier]['auto_restart']:
                         continue
-                    user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
                     file_ext = os.path.splitext(file_name)[1].lower()
                     if file_ext == '.py':
                         threading.Thread(target=self._restart_py_script,
-                                         args=(user_id, file_path, user_folder, file_name)).start()
+                                         args=(user_id, file_path, run_dir, file_name)).start()
                     elif file_ext == '.js':
                         threading.Thread(target=self._restart_js_script,
-                                         args=(user_id, file_path, user_folder, file_name)).start()
+                                         args=(user_id, file_path, run_dir, file_name)).start()
+                    elif file_ext == '.zip':
+                        # For zip, file_path points to main.py inside extracted folder
+                        threading.Thread(target=self._restart_py_script,
+                                         args=(user_id, file_path, run_dir, file_name)).start()
                     recovered.append({"user_id": user_id, "file_name": file_name, "status": "recovering"})
                     time.sleep(1)
                 except Exception as e:
@@ -472,37 +485,37 @@ class AutoRecoverySystem:
             logger.error(f"❌ Error in recovery system: {e}")
             return []
 
-    def _restart_py_script(self, user_id, file_path, user_folder, file_name):
+    def _restart_py_script(self, user_id, file_path, run_dir, file_name):
         try:
             script_key = f"{user_id}_{file_name}"
             if script_key in bot_scripts:
                 return
-            log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+            log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
             log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-            process = subprocess.Popen([sys.executable, file_path], cwd=user_folder,
+            process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
                                        stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                        encoding='utf-8', errors='ignore')
             bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                        'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
                                        'script_key': script_key}
-            self.save_running_script(user_id, file_name, file_path, process.pid)
+            self.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         except Exception as e:
             logger.error(f"❌ Error restarting Python script {file_name}: {e}")
 
-    def _restart_js_script(self, user_id, file_path, user_folder, file_name):
+    def _restart_js_script(self, user_id, file_path, run_dir, file_name):
         try:
             script_key = f"{user_id}_{file_name}"
             if script_key in bot_scripts:
                 return
-            log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+            log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
             log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-            process = subprocess.Popen(['node', file_path], cwd=user_folder,
+            process = subprocess.Popen(['node', file_path], cwd=run_dir,
                                        stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                        encoding='utf-8', errors='ignore')
             bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                        'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
                                        'script_key': script_key}
-            self.save_running_script(user_id, file_name, file_path, process.pid)
+            self.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         except Exception as e:
             logger.error(f"❌ Error restarting JS script {file_name}: {e}")
 
@@ -530,9 +543,9 @@ def init_db():
         if db is None:
             logger.error("❌ Could not connect to MongoDB.")
             return
-        # Create indexes for efficiency
         db['user_files'].create_index([('user_id', 1), ('file_name', 1)], unique=True)
         db['active_users'].create_index([('user_id', 1)], unique=True)
+        db['authorized_users'].create_index([('user_id', 1)], unique=True)
         logger.info("✅ MongoDB initialized successfully.")
     except Exception as e:
         logger.error(f"❌ MongoDB init error: {e}")
@@ -545,7 +558,6 @@ def load_data():
             logger.warning("⚠️ MongoDB unavailable — starting with empty data.")
             return
 
-        # Load user files
         for doc in db['user_files'].find():
             uid = doc['user_id']
             if uid not in user_files:
@@ -553,11 +565,14 @@ def load_data():
             if not any(fname == doc['file_name'] for fname, _ in user_files[uid]):
                 user_files[uid].append((doc['file_name'], doc.get('file_type', 'py')))
 
-        # Load active users
         for doc in db['active_users'].find():
             active_users.add(doc['user_id'])
 
-        logger.info(f"✅ Data loaded: {len(active_users)} users, {sum(len(v) for v in user_files.values())} files")
+        # Load authorized users
+        for doc in db['authorized_users'].find():
+            authorized_users.add(doc['user_id'])
+
+        logger.info(f"✅ Data loaded: {len(active_users)} users, {len(authorized_users)} authorized, {sum(len(v) for v in user_files.values())} files")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}")
 
@@ -637,6 +652,30 @@ def send_restart_notification():
         time.sleep(0.1)
     logger.info(f"📤 Restart notifications sent: {sent}")
 
+def grant_user_access(user_id: int, username: str = None):
+    """Grant access to a user (called by admin)."""
+    authorized_users.add(user_id)
+    try:
+        db = get_mongo_db()
+        if db is not None:
+            db['authorized_users'].update_one(
+                {'user_id': user_id},
+                {'$set': {'user_id': user_id, 'username': username, 'granted_at': datetime.now().isoformat()}},
+                upsert=True
+            )
+    except Exception as e:
+        logger.error(f"❌ Error granting access: {e}")
+
+def revoke_user_access(user_id: int):
+    """Revoke access from a user (called by admin)."""
+    authorized_users.discard(user_id)
+    try:
+        db = get_mongo_db()
+        if db is not None:
+            db['authorized_users'].delete_one({'user_id': user_id})
+    except Exception as e:
+        logger.error(f"❌ Error revoking access: {e}")
+
 
 # ================================
 # 𝐃𝐁 𝐎𝐏𝐄𝐑𝐀𝐓𝐈𝐎𝐍𝐒 (MongoDB)
@@ -656,15 +695,17 @@ def add_active_user(user_id, username=None):
         logger.error(f"❌ Error adding active user: {e}")
     active_users.add(user_id)
 
-def save_user_file_db(user_id, file_name, file_type):
+def save_user_file_db(user_id, file_name, file_type, extra_path=None):
     try:
         db = get_mongo_db()
         now = datetime.now().isoformat()
+        doc = {'user_id': user_id, 'file_name': file_name, 'file_type': file_type, 'uploaded_at': now}
+        if extra_path:
+            doc['extra_path'] = extra_path
         if db is not None:
             db['user_files'].update_one(
                 {'user_id': user_id, 'file_name': file_name},
-                {'$set': {'user_id': user_id, 'file_name': file_name,
-                          'file_type': file_type, 'uploaded_at': now}},
+                {'$set': doc},
                 upsert=True
             )
     except Exception as e:
@@ -686,40 +727,108 @@ def remove_user_file_db(user_id, file_name):
     recovery_system.remove_running_script(user_id, file_name)
     return True
 
+def get_file_extra_path(user_id, file_name):
+    """Get extra info (like the main.py path for ZIP files) from DB."""
+    try:
+        db = get_mongo_db()
+        if db is not None:
+            doc = db['user_files'].find_one({'user_id': user_id, 'file_name': file_name})
+            if doc:
+                return doc.get('extra_path')
+    except Exception:
+        pass
+    return None
+
 
 # ================================
-# 𝐁𝐔𝐓𝐓𝐎𝐍 𝐋𝐀𝐘𝐎𝐔𝐓𝐒
+# 𝐙𝐈𝐏 𝐇𝐀𝐍𝐃𝐋𝐈𝐍𝐆
 # ================================
-def create_reply_keyboard_main_menu(user_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    buttons = [
-        B("📤 𝐔𝐩𝐥𝐨𝐚𝐝"),
-        B("📂 𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬"),
-        B("⚡ 𝐒𝐩𝐞𝐞𝐝"),
-        B("📊 𝐒𝐭𝐚𝐭𝐬"),
-        B("👤 𝐏𝐫𝐨𝐟𝐢𝐥𝐞"),
-        B("📦 𝐌𝐨𝐝𝐮𝐥𝐞"),
-        B("🔄 𝐑𝐞𝐜𝐨𝐯𝐞𝐫"),
-        B("🚀 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 𝐁𝐨𝐭"),
-    ]
-    for i in range(0, len(buttons), 2):
-        row = buttons[i:i+2]
-        markup.add(*[types.KeyboardButton(text) for text in row])
-    return markup
+def find_main_py_in_zip(zf: zipfile.ZipFile):
+    """
+    Find main.py inside a ZIP file.
+    Preference order:
+    1. main.py at root of ZIP
+    2. main.py one level deep
+    3. Any .py file at root
+    """
+    names = zf.namelist()
+    # Strip leading slash if any
+    names = [n.lstrip('/') for n in names]
 
-def create_control_buttons(user_id, file_name, is_running=True):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    if is_running:
-        markup.add(types.KeyboardButton(B(f"🔴 𝐒𝐭𝐨𝐩 {file_name}")),
-                   types.KeyboardButton(B(f"🔄 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 {file_name}")))
-        markup.add(types.KeyboardButton(B(f"🗑️ 𝐃𝐞𝐥𝐞𝐭𝐞 {file_name}")),
-                   types.KeyboardButton(B(f"📜 𝐋𝐨𝐠𝐬 {file_name}")))
-    else:
-        markup.add(types.KeyboardButton(B(f"🟢 𝐒𝐭𝐚𝐫𝐭 {file_name}")),
-                   types.KeyboardButton(B(f"🗑️ 𝐃𝐞𝐥𝐞𝐭𝐞 {file_name}")))
-        markup.add(types.KeyboardButton(B(f"📜 𝐕𝐢𝐞𝐰 𝐋𝐨𝐠𝐬 {file_name}")))
-    markup.add(types.KeyboardButton(B("🔙 𝐁𝐚𝐜𝐤")))
-    return markup
+    # 1. Exact root main.py
+    for n in names:
+        if n == 'main.py' or (not '/' in n and n.endswith('main.py')):
+            return n
+
+    # 2. main.py one folder deep
+    for n in names:
+        parts = n.split('/')
+        if len(parts) == 2 and parts[1] == 'main.py':
+            return n
+
+    # 3. Any .py at root level
+    for n in names:
+        if '/' not in n and n.endswith('.py'):
+            return n
+
+    return None
+
+def extract_and_setup_zip(zip_path, user_folder, zip_name):
+    """
+    Extract ZIP to a subfolder, install requirements if present,
+    return (main_py_path, run_dir) or (None, None) on failure.
+    """
+    base_name = os.path.splitext(zip_name)[0]
+    extract_dir = os.path.join(user_folder, base_name)
+    os.makedirs(extract_dir, exist_ok=True)
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            main_rel = find_main_py_in_zip(zf)
+            if main_rel is None:
+                return None, None, "No main.py found inside the ZIP."
+            zf.extractall(extract_dir)
+
+        # Determine run directory and main.py abs path
+        # If main.py is inside a subfolder, run_dir = that subfolder
+        parts = main_rel.split('/')
+        if len(parts) == 1:
+            # main.py is at root of ZIP → extract_dir is run_dir
+            run_dir = extract_dir
+            main_py_path = os.path.join(extract_dir, main_rel)
+        else:
+            # main.py is inside a subfolder
+            run_dir = os.path.join(extract_dir, *parts[:-1])
+            main_py_path = os.path.join(extract_dir, *parts)
+
+        # Install requirements.txt if present in run_dir
+        req_path = os.path.join(run_dir, 'requirements.txt')
+        if not os.path.exists(req_path):
+            # Try in extract_dir root
+            req_path = os.path.join(extract_dir, 'requirements.txt')
+
+        if os.path.exists(req_path):
+            try:
+                subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--quiet', '--break-system-packages'],
+                    capture_output=True, text=True, check=False, timeout=120
+                )
+                logger.info(f"✅ Installed requirements.txt for {zip_name}")
+            except Exception as e:
+                logger.warning(f"⚠️ requirements.txt install error: {e}")
+
+        # Auto-detect and install imports from main.py
+        try:
+            auto_setup_user_env_from_path(main_py_path, run_dir)
+        except Exception:
+            pass
+
+        return main_py_path, run_dir, None
+
+    except zipfile.BadZipFile:
+        return None, None, "Invalid ZIP file."
+    except Exception as e:
+        return None, None, str(e)
 
 
 # ================================
@@ -790,9 +899,8 @@ TELEGRAM_MODULES = {
     'PIL.Image': 'Pillow',
     'PIL.ImageDraw': 'Pillow',
     'PIL.ImageFont': 'Pillow',
+    'dnspython': 'dnspython',
 }
-
-pending_module_installs = {}
 
 def auto_generate_requirements(file_path, user_folder):
     try:
@@ -808,10 +916,6 @@ def auto_generate_requirements(file_path, user_folder):
             if mod in stdlib or mod in seen:
                 continue
             seen.add(mod)
-            try:
-                __import__(mod)
-            except ImportError:
-                pass
             pip_name = TELEGRAM_MODULES.get(mod.lower(), mod)
             if pip_name:
                 requirements.append(pip_name)
@@ -827,29 +931,8 @@ def auto_generate_requirements(file_path, user_folder):
         logger.error(f"❌ Error generating requirements: {e}")
         return []
 
-def auto_generate_procfile(user_folder, file_name):
-    try:
-        with open(os.path.join(user_folder, 'Procfile'), 'w') as f:
-            f.write(f'web: python {file_name}\n')
-        return True
-    except Exception:
-        return False
-
-def auto_setup_user_env(user_id, file_name):
-    user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
-    requirements = auto_generate_requirements(file_path, user_folder)
-    auto_generate_procfile(user_folder, file_name)
-    if requirements:
-        for pip_name in sorted(set(requirements)):
-            try:
-                subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name],
-                               capture_output=True, text=True, check=False)
-            except Exception:
-                pass
-    return requirements
-
-def scan_required_modules(file_path):
+def auto_setup_user_env_from_path(file_path, run_dir):
+    """Detect and install imports from a specific python file."""
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -857,7 +940,6 @@ def scan_required_modules(file_path):
         imports |= set(re.findall(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', content, re.MULTILINE))
         top_level = sorted(set(i.split('.')[0] for i in imports))
         stdlib = set(getattr(sys, 'stdlib_module_names', []))
-        required = []
         for mod in top_level:
             if mod in stdlib:
                 continue
@@ -866,28 +948,60 @@ def scan_required_modules(file_path):
             except ImportError:
                 pip_name = TELEGRAM_MODULES.get(mod.lower(), mod)
                 if pip_name:
-                    required.append(pip_name)
-        return sorted(set(required))
-    except Exception:
-        return []
-
-def attempt_install_pip(module_name, message):
-    package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name)
-    if package_name is None:
-        return False
-    try:
-        bot.reply_to(message, B(f"🐍 𝐈𝐧𝐬𝐭𝐚𝐥𝐥𝐢𝐧𝐠 `{module_name}`..."))
-        result = subprocess.run([sys.executable, '-m', 'pip', 'install', package_name],
-                                capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            bot.reply_to(message, B(f"✅ 𝐏𝐚𝐜𝐤𝐚𝐠𝐞 `{package_name}` 𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝."))
-            return True
-        else:
-            bot.reply_to(message, B(f"❌ 𝐅𝐚𝐢𝐥𝐞𝐝 𝐭𝐨 𝐢𝐧𝐬𝐭𝐚𝐥𝐥 `{package_name}`."))
-            return False
+                    subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name, '--quiet', '--break-system-packages'],
+                                   capture_output=True, text=True, check=False)
     except Exception as e:
-        bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫: {str(e)}"))
-        return False
+        logger.error(f"❌ Error in auto setup: {e}")
+
+def auto_setup_user_env(user_id, file_name):
+    user_folder = get_user_folder(user_id)
+    file_path = os.path.join(user_folder, file_name)
+    requirements = auto_generate_requirements(file_path, user_folder)
+    if requirements:
+        for pip_name in sorted(set(requirements)):
+            try:
+                subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name, '--quiet', '--break-system-packages'],
+                               capture_output=True, text=True, check=False)
+            except Exception:
+                pass
+    return requirements
+
+
+# ================================
+# 𝐁𝐔𝐓𝐓𝐎𝐍 𝐋𝐀𝐘𝐎𝐔𝐓𝐒
+# ================================
+def create_reply_keyboard_main_menu(user_id):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    buttons = [
+        B("📤 𝐔𝐩𝐥𝐨𝐚𝐝"),
+        B("📂 𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬"),
+        B("⚡ 𝐒𝐩𝐞𝐞𝐝"),
+        B("📊 𝐒𝐭𝐚𝐭𝐬"),
+        B("👤 𝐏𝐫𝐨𝐟𝐢𝐥𝐞"),
+        B("📦 𝐌𝐨𝐝𝐮𝐥𝐞"),
+        B("🔄 𝐑𝐞𝐜𝐨𝐯𝐞𝐫"),
+        B("🚀 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 𝐁𝐨𝐭"),
+    ]
+    if user_id == OWNER_ID:
+        buttons.append(B("👑 𝐀𝐝𝐦𝐢𝐧"))
+    for i in range(0, len(buttons), 2):
+        row = buttons[i:i+2]
+        markup.add(*[types.KeyboardButton(text) for text in row])
+    return markup
+
+def create_control_buttons(user_id, file_name, is_running=True):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    if is_running:
+        markup.add(types.KeyboardButton(B(f"🔴 𝐒𝐭𝐨𝐩 {file_name}")),
+                   types.KeyboardButton(B(f"🔄 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 {file_name}")))
+        markup.add(types.KeyboardButton(B(f"🗑️ 𝐃𝐞𝐥𝐞𝐭𝐞 {file_name}")),
+                   types.KeyboardButton(B(f"📜 𝐋𝐨𝐠𝐬 {file_name}")))
+    else:
+        markup.add(types.KeyboardButton(B(f"🟢 𝐒𝐭𝐚𝐫𝐭 {file_name}")),
+                   types.KeyboardButton(B(f"🗑️ 𝐃𝐞𝐥𝐞𝐭𝐞 {file_name}")))
+        markup.add(types.KeyboardButton(B(f"📜 𝐕𝐢𝐞𝐰 𝐋𝐨𝐠𝐬 {file_name}")))
+    markup.add(types.KeyboardButton(B("🔙 𝐁𝐚𝐜𝐤")))
+    return markup
 
 
 # ================================
@@ -900,7 +1014,7 @@ def send_welcome(message):
     user_tier = get_user_tier(user_id)
     tier_info = TIER_SYSTEM[user_tier]
     welcome_text = f"""╔══════════════════════════════════╗
-║    🚀 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐁𝐎𝐓 𝐕𝟒.𝟎          ║
+║    🚀 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐁𝐎𝐓 𝐕𝟒.𝟏          ║
 ║    𝐇𝐎𝐒𝐓𝐈𝐍𝐆 𝐏𝐀𝐍𝐄𝐋                 ║
 ╚══════════════════════════════════╝
 
@@ -915,17 +1029,17 @@ def send_welcome(message):
 🔄 𝐀𝐮𝐭𝐨-𝐫𝐞𝐜𝐨𝐯𝐞𝐫𝐲
 📜 𝐋𝐢𝐯𝐞 𝐥𝐨𝐠𝐬
 ⚡ 𝐒𝐩𝐞𝐞𝐝 𝐭𝐞𝐬𝐭
+📦 𝐙𝐈𝐏 𝐬𝐮𝐩𝐩𝐨𝐫𝐭 (𝐦𝐚𝐢𝐧.𝐩𝐲 + 𝐦𝐨𝐝𝐮𝐥𝐞𝐬)
 
 *𝐒𝐮𝐩𝐩𝐨𝐫𝐭𝐞𝐝:*
 • 𝐏𝐲𝐭𝐡𝐨𝐧 (.𝐩𝐲)
 • 𝐍𝐨𝐝𝐞.𝐣𝐬 (.𝐣𝐬)
-• 𝐓𝐞𝐥𝐞𝐛𝐨𝐭, 𝐓𝐞𝐥𝐞𝐠𝐫𝐚𝐦, 𝐀𝐢𝐨𝐠𝐫𝐚𝐦, 𝐏𝐲𝐫𝐨𝐠𝐫𝐚𝐦, 𝐓𝐞𝐥𝐞𝐭𝐡𝐨𝐧
-• 𝐀𝐧𝐝 𝐦𝐨𝐫𝐞!
+• 𝐙𝐈𝐏 (.𝐳𝐢𝐩) — 𝐦𝐚𝐢𝐧.𝐩𝐲 + 𝐦𝐨𝐝𝐮𝐥𝐞𝐬
 
 *𝐇𝐨𝐰 𝐭𝐨 𝐬𝐞𝐧𝐝 𝐚 𝐟𝐢𝐥𝐞:*
 1️⃣ 𝐓𝐚𝐩 📎 𝐚𝐭𝐭𝐚𝐜𝐡𝐦𝐞𝐧𝐭 𝐛𝐮𝐭𝐭𝐨𝐧
 2️⃣ 𝐒𝐞𝐥𝐞𝐜𝐭 "𝐅𝐢𝐥𝐞" (𝐧𝐨𝐭 𝐩𝐡𝐨𝐭𝐨)
-3️⃣ 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 .𝐩𝐲 𝐨𝐫 .𝐣𝐬 𝐟𝐢𝐥𝐞
+3️⃣ 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 .𝐩𝐲, .𝐣𝐬 𝐨𝐫 .𝐳𝐢𝐩 𝐟𝐢𝐥𝐞
 4️⃣ 𝐔𝐬𝐞 "𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬" 𝐭𝐨 𝐒𝐭𝐚𝐫𝐭/𝐒𝐭𝐨𝐩"""
 
     msg = bot.reply_to(message, welcome_text, parse_mode='Markdown',
@@ -948,15 +1062,25 @@ def send_help(message):
 /stats — 𝐘𝐨𝐮𝐫 𝐬𝐭𝐚𝐭𝐬
 /profile — 𝐘𝐨𝐮𝐫 𝐩𝐫𝐨𝐟𝐢𝐥𝐞
 /speed — 𝐒𝐩𝐞𝐞𝐝 𝐭𝐞𝐬𝐭
+/logs <filename> — 𝐕𝐢𝐞𝐰 𝐥𝐨𝐠𝐬
+
+*𝐀𝐝𝐦𝐢𝐧 𝐨𝐧𝐥𝐲:*
+/adduser <user_id> — 𝐆𝐫𝐚𝐧𝐭 𝐚𝐜𝐜𝐞𝐬𝐬
+/removeuser <user_id> — 𝐑𝐞𝐯𝐨𝐤𝐞 𝐚𝐜𝐜𝐞𝐬𝐬
+/listusers — 𝐋𝐢𝐬𝐭 𝐚𝐮𝐭𝐡𝐨𝐫𝐢𝐳𝐞𝐝 𝐮𝐬𝐞𝐫𝐬
 
 *𝐇𝐨𝐰 𝐭𝐨 𝐮𝐬𝐞:*
 1️⃣ 𝐓𝐚𝐩 📎 𝐚𝐭𝐭𝐚𝐜𝐡𝐦𝐞𝐧𝐭 → 𝐅𝐢𝐥𝐞
-2️⃣ 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 .𝐩𝐲 𝐨𝐫 .𝐣𝐬 𝐟𝐢𝐥𝐞
+2️⃣ 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 .𝐩𝐲, .𝐣𝐬, 𝐨𝐫 .𝐳𝐢𝐩 𝐟𝐢𝐥𝐞
 3️⃣ 𝐌𝐨𝐝𝐮𝐥𝐞𝐬 𝐚𝐮𝐭𝐨-𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝
 4️⃣ 𝐂𝐥𝐢𝐜𝐤 𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬 → 𝐒𝐭𝐚𝐫𝐭
-5️⃣ 𝐕𝐢𝐞𝐰 𝐥𝐢𝐯𝐞 𝐥𝐨𝐠𝐬, 𝐑𝐞𝐬𝐭𝐚𝐫𝐭/𝐒𝐭𝐨𝐩/𝐃𝐞𝐥𝐞𝐭𝐞 𝐚𝐧𝐲𝐭𝐢𝐦𝐞
+5️⃣ 𝐕𝐢𝐞𝐰 𝐥𝐢𝐯𝐞 𝐥𝐨𝐠𝐬 𝐰𝐢𝐭𝐡 📜 𝐋𝐨𝐠𝐬 𝐛𝐮𝐭𝐭𝐨𝐧
 
-*𝐌𝐮𝐥𝐭𝐢𝐩𝐥𝐞 𝐁𝐨𝐭𝐬:* 𝐔𝐩𝐥𝐨𝐚𝐝 𝐦𝐮𝐥𝐭𝐢𝐩𝐥𝐞 𝐟𝐢𝐥𝐞𝐬 𝐚𝐧𝐝 𝐫𝐮𝐧 𝐭𝐡𝐞𝐦 𝐚𝐥𝐥 𝐚𝐭 𝐨𝐧𝐜𝐞!
+*𝐙𝐈𝐏 𝐅𝐢𝐥𝐞𝐬:*
+• 𝐏𝐮𝐭 𝐲𝐨𝐮𝐫 𝐦𝐚𝐢𝐧.𝐩𝐲 + 𝐦𝐨𝐝𝐮𝐥𝐞𝐬 𝐢𝐧 𝐚 .𝐳𝐢𝐩
+• 𝐁𝐨𝐭 𝐟𝐢𝐧𝐝𝐬 𝐦𝐚𝐢𝐧.𝐩𝐲 𝐚𝐮𝐭𝐨𝐦𝐚𝐭𝐢𝐜𝐚𝐥𝐥𝐲
+• 𝐫𝐞𝐪𝐮𝐢𝐫𝐞𝐦𝐞𝐧𝐭𝐬.𝐭𝐱𝐭 𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝 𝐢𝐟 𝐩𝐫𝐞𝐬𝐞𝐧𝐭
+
 *𝐀𝐮𝐭𝐨-𝐑𝐞𝐜𝐨𝐯𝐞𝐫𝐲:* ✅ 𝐄𝐧𝐚𝐛𝐥𝐞𝐝"""
     bot.reply_to(message, help_text, parse_mode='Markdown',
                  reply_markup=create_reply_keyboard_main_menu(user_id))
@@ -979,7 +1103,7 @@ def show_stats(message):
 *𝐀𝐜𝐜𝐨𝐮𝐧𝐭 𝐈𝐧𝐟𝐨:*
 🆔 𝐔𝐬𝐞𝐫 𝐈𝐃: `{user_id}`
 👤 𝐔𝐬𝐞𝐫𝐧𝐚𝐦𝐞: @{message.from_user.username or '𝐍𝐎𝐓 𝐒𝐄𝐓'}
-📅 𝐉𝐨𝐢𝐧𝐞𝐝: {datetime.now().strftime('%Y-%m-%d')}"""
+📅 𝐃𝐚𝐭𝐞: {datetime.now().strftime('%Y-%m-%d')}"""
     msg = bot.reply_to(message, stats_text, parse_mode='Markdown',
                        reply_markup=create_reply_keyboard_main_menu(user_id))
     try:
@@ -1000,7 +1124,8 @@ def show_profile(message):
 👤 *𝐍𝐚𝐦𝐞:* {message.from_user.first_name}
 🆔 *𝐔𝐬𝐞𝐫 𝐈𝐃:* `{user_id}`
 @ *𝐔𝐬𝐞𝐫𝐧𝐚𝐦𝐞:* @{message.from_user.username or '𝐍𝐎𝐓 𝐒𝐄𝐓'}
-{tier_info['icon']} *𝐓𝐢𝐞𝐫:* {tier_info['name']}"""
+{tier_info['icon']} *𝐓𝐢𝐞𝐫:* {tier_info['name']}
+🔐 *𝐀𝐜𝐜𝐞𝐬𝐬:* {'👑 Owner' if user_id == OWNER_ID else '✅ Authorized'}"""
     bot.reply_to(message, profile_text, parse_mode='Markdown',
                  reply_markup=create_reply_keyboard_main_menu(user_id))
 
@@ -1026,6 +1151,78 @@ def run_speedtest(message):
         bot.edit_message_text(speed_text, message.chat.id, msg.message_id, parse_mode='Markdown')
     except Exception:
         pass
+
+@bot.message_handler(commands=['logs'])
+def cmd_logs(message):
+    """View logs for a file: /logs <filename>"""
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(message, B("❓ 𝐔𝐬𝐚𝐠𝐞: /logs <filename>\n𝐄𝐱𝐚𝐦𝐩𝐥𝐞: /logs bot.py"), parse_mode='Markdown')
+        return
+    file_name = args[1].strip()
+    _show_logs(message, user_id, file_name)
+
+# ================================
+# 𝐀𝐃𝐌𝐈𝐍 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒
+# ================================
+@bot.message_handler(commands=['adduser'])
+def cmd_adduser(message):
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "🔒 Owner only.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❓ Usage: /adduser <user_id>")
+        return
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID. Must be a number.")
+        return
+    grant_user_access(target_id)
+    bot.reply_to(message, f"✅ User `{target_id}` has been granted access.", parse_mode='Markdown')
+    # Notify the user if possible
+    try:
+        bot.send_message(target_id, "✅ 𝐘𝐨𝐮 𝐡𝐚𝐯𝐞 𝐛𝐞𝐞𝐧 𝐠𝐫𝐚𝐧𝐭𝐞𝐝 𝐚𝐜𝐜𝐞𝐬𝐬 𝐭𝐨 𝐭𝐡𝐞 𝐇𝐨𝐬𝐭𝐢𝐧𝐠 𝐁𝐨𝐭!\n\nSend /start to begin.")
+    except Exception:
+        pass
+
+@bot.message_handler(commands=['removeuser'])
+def cmd_removeuser(message):
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "🔒 Owner only.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❓ Usage: /removeuser <user_id>")
+        return
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID. Must be a number.")
+        return
+    if target_id == OWNER_ID:
+        bot.reply_to(message, "❌ Cannot remove owner.")
+        return
+    revoke_user_access(target_id)
+    bot.reply_to(message, f"✅ Access revoked for user `{target_id}`.", parse_mode='Markdown')
+
+@bot.message_handler(commands=['listusers'])
+def cmd_listusers(message):
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "🔒 Owner only.")
+        return
+    if not authorized_users:
+        bot.reply_to(message, "📭 No authorized users yet.\nUse /adduser <user_id> to grant access.")
+        return
+    lines = ["╔══════════════════════════════════╗",
+             "║    👥 𝐀𝐔𝐓𝐇𝐎𝐑𝐈𝐙𝐄𝐃 𝐔𝐒𝐄𝐑𝐒        ║",
+             "╚══════════════════════════════════╝", ""]
+    for uid in sorted(authorized_users):
+        lines.append(f"• `{uid}`")
+    lines.append(f"\n*𝐓𝐨𝐭𝐚𝐥:* {len(authorized_users)} users")
+    bot.reply_to(message, '\n'.join(lines), parse_mode='Markdown')
 
 
 # ================================
@@ -1056,21 +1253,41 @@ def handle_document(message):
         downloaded_file = bot.download_file(file_info.file_path)
         with open(file_path, 'wb') as f:
             f.write(downloaded_file)
-        file_type = 'py' if file_ext == '.py' else ('js' if file_ext == '.js' else 'zip')
-        save_user_file_db(user_id, file_name, file_type)
+
         if file_ext == '.py':
+            file_type = 'py'
             try:
                 auto_setup_user_env(user_id, file_name)
             except Exception:
                 pass
+            save_user_file_db(user_id, file_name, file_type)
+
+        elif file_ext == '.js':
+            file_type = 'js'
+            save_user_file_db(user_id, file_name, file_type)
+
         elif file_ext == '.zip':
-            try:
-                with zipfile.ZipFile(file_path, 'r') as zf:
-                    zf.extractall(user_folder)
-            except Exception:
-                pass
-        time.sleep(3)
+            # Extract and find main.py
+            status_msg = bot.edit_message_text(
+                B("📦 𝐄𝐱𝐭𝐫𝐚𝐜𝐭𝐢𝐧𝐠 𝐙𝐈𝐏 𝐚𝐧𝐝 𝐬𝐜𝐚𝐧𝐧𝐢𝐧𝐠 𝐟𝐨𝐫 𝐦𝐚𝐢𝐧.𝐩𝐲..."),
+                message.chat.id, msg.message_id
+            )
+            main_py_path, run_dir, err = extract_and_setup_zip(file_path, user_folder, file_name)
+            if err or main_py_path is None:
+                bot.edit_message_text(
+                    B(f"❌ 𝐙𝐈𝐏 𝐄𝐫𝐫𝐨𝐫: {err or 'main.py not found in ZIP.'}"),
+                    message.chat.id, msg.message_id
+                )
+                return
+            file_type = 'zip'
+            # Store the path to main.py in extra_path, run_dir in file type metadata
+            save_user_file_db(user_id, file_name, file_type, extra_path=f"{main_py_path}|{run_dir}")
+
+        time.sleep(2)
         tier_info = TIER_SYSTEM[get_user_tier(user_id)]
+        extra_info = ""
+        if file_ext == '.zip':
+            extra_info = f"\n📂 *𝐌𝐚𝐢𝐧:* `{os.path.basename(main_py_path)}`\n📁 *𝐑𝐮𝐧 𝐝𝐢𝐫:* `{os.path.basename(run_dir)}/`"
         upload_text = f"""╔══════════════════════════════════╗
 ║    ✅ 𝐔𝐏𝐋𝐎𝐀𝐃 𝐒𝐔𝐂𝐂𝐄𝐒𝐒𝐅𝐔𝐋         ║
 ╠══════════════════════════════════╣
@@ -1081,7 +1298,7 @@ def handle_document(message):
 
 📊 *𝐒𝐭𝐚𝐭𝐮𝐬:* 𝐑𝐞𝐚𝐝𝐲 𝐭𝐨 𝐡𝐨𝐬𝐭
 🔄 *𝐀𝐮𝐭𝐨-𝐑𝐞𝐜𝐨𝐯𝐞𝐫𝐲:* ✅ 𝐄𝐧𝐚𝐛𝐥𝐞𝐝
-📦 *𝐌𝐨𝐝𝐮𝐥𝐞𝐬:* 𝐀𝐮𝐭𝐨-𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝
+📦 *𝐌𝐨𝐝𝐮𝐥𝐞𝐬:* 𝐀𝐮𝐭𝐨-𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝{extra_info}
 
 👉 𝐍𝐨𝐰 𝐮𝐬𝐞 "𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬" 𝐭𝐨 𝐒𝐭𝐚𝐫𝐭!"""
         bot.edit_message_text(upload_text, message.chat.id, msg.message_id, parse_mode='Markdown',
@@ -1118,29 +1335,50 @@ def handle_file_control_text(message):
     elif "📜" in text and ("𝐋𝐨𝐠𝐬" in text or "𝐕𝐢𝐞𝐰" in text):
         _show_logs(message, user_id, file_name)
 
-def _start_script(message, user_id, file_name):
+def _get_run_params(user_id, file_name):
+    """Return (file_path, run_dir, file_type) for starting a script."""
     user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
-    if not os.path.exists(file_path):
-        bot.reply_to(message, B(f"❌ 𝐅𝐢𝐥𝐞 𝐧𝐨𝐭 𝐟𝐨𝐮𝐧𝐝: `{file_name}`"), parse_mode='Markdown')
-        return
-    if is_bot_running(user_id, file_name):
-        bot.reply_to(message, B(f"⚠️ `{file_name}` 𝐢𝐬 𝐚𝐥𝐫𝐞𝐚𝐝𝐲 𝐫𝐮𝐧𝐧𝐢𝐧𝐠."), parse_mode='Markdown')
-        return
     file_type = 'py'
     for fname, ftype in user_files.get(user_id, []):
         if fname == file_name:
             file_type = ftype
             break
+
+    if file_type == 'zip':
+        # Look up extra_path from DB
+        extra_path = get_file_extra_path(user_id, file_name)
+        if extra_path and '|' in extra_path:
+            main_py_path, run_dir = extra_path.split('|', 1)
+            if os.path.exists(main_py_path):
+                return main_py_path, run_dir, 'zip'
+        # Fallback: try to find extracted dir
+        base_name = os.path.splitext(file_name)[0]
+        extract_dir = os.path.join(user_folder, base_name)
+        main_py_path = os.path.join(extract_dir, 'main.py')
+        if os.path.exists(main_py_path):
+            return main_py_path, extract_dir, 'zip'
+        return None, None, 'zip'
+
+    file_path = os.path.join(user_folder, file_name)
+    return file_path, user_folder, file_type
+
+def _start_script(message, user_id, file_name):
+    file_path, run_dir, file_type = _get_run_params(user_id, file_name)
+    if not file_path or not os.path.exists(file_path):
+        bot.reply_to(message, B(f"❌ 𝐅𝐢𝐥𝐞 𝐧𝐨𝐭 𝐟𝐨𝐮𝐧𝐝: `{file_name}`"), parse_mode='Markdown')
+        return
+    if is_bot_running(user_id, file_name):
+        bot.reply_to(message, B(f"⚠️ `{file_name}` 𝐢𝐬 𝐚𝐥𝐫𝐞𝐚𝐝𝐲 𝐫𝐮𝐧𝐧𝐢𝐧𝐠."), parse_mode='Markdown')
+        return
     msg = bot.reply_to(message, B(f"🚀 𝐒𝐭𝐚𝐫𝐭𝐢𝐧𝐠 `{file_name}`..."))
     try:
         AnimationManager.animate_start(message.chat.id, msg.message_id)
     except Exception:
         pass
-    if file_type == 'py':
-        threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, msg)).start()
+    if file_type in ('py', 'zip'):
+        threading.Thread(target=run_script, args=(file_path, user_id, run_dir, file_name, msg)).start()
     elif file_type == 'js':
-        threading.Thread(target=run_js_script, args=(file_path, user_id, user_folder, file_name, msg)).start()
+        threading.Thread(target=run_js_script, args=(file_path, user_id, run_dir, file_name, msg)).start()
 
 def _stop_script(message, user_id, file_name):
     script_key = f"{user_id}_{file_name}"
@@ -1173,25 +1411,19 @@ def _restart_script(message, user_id, file_name):
             if script_key in bot_scripts:
                 del bot_scripts[script_key]
         time.sleep(1)
-    user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
-    if not os.path.exists(file_path):
+    file_path, run_dir, file_type = _get_run_params(user_id, file_name)
+    if not file_path or not os.path.exists(file_path):
         bot.reply_to(message, B(f"❌ 𝐅𝐢𝐥𝐞 𝐧𝐨𝐭 𝐟𝐨𝐮𝐧𝐝: `{file_name}`"), parse_mode='Markdown')
         return
-    file_type = 'py'
-    for fname, ftype in user_files.get(user_id, []):
-        if fname == file_name:
-            file_type = ftype
-            break
     msg = bot.reply_to(message, B(f"🔄 𝐑𝐞𝐬𝐭𝐚𝐫𝐭𝐢𝐧𝐠 `{file_name}`..."))
     try:
         AnimationManager.animate_restart(message.chat.id, msg.message_id)
     except Exception:
         pass
-    if file_type == 'py':
-        threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, msg)).start()
+    if file_type in ('py', 'zip'):
+        threading.Thread(target=run_script, args=(file_path, user_id, run_dir, file_name, msg)).start()
     elif file_type == 'js':
-        threading.Thread(target=run_js_script, args=(file_path, user_id, user_folder, file_name, msg)).start()
+        threading.Thread(target=run_js_script, args=(file_path, user_id, run_dir, file_name, msg)).start()
 
 def _delete_script(message, user_id, file_name):
     msg = bot.reply_to(message, B(f"🗑️ 𝐃𝐞𝐥𝐞𝐭𝐢𝐧𝐠 `{file_name}`..."))
@@ -1212,6 +1444,17 @@ def _delete_script(message, user_id, file_name):
         os.remove(file_path)
     if os.path.exists(log_path):
         os.remove(log_path)
+    # Also remove extracted ZIP folder if applicable
+    file_type = 'py'
+    for fname, ftype in user_files.get(user_id, []):
+        if fname == file_name:
+            file_type = ftype
+            break
+    if file_type == 'zip':
+        base_name = os.path.splitext(file_name)[0]
+        extract_dir = os.path.join(user_folder, base_name)
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
     remove_user_file_db(user_id, file_name)
     time.sleep(1.5)
     try:
@@ -1224,15 +1467,15 @@ def _delete_script(message, user_id, file_name):
 def _show_logs(message, user_id, file_name):
     user_folder = get_user_folder(user_id)
     log_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
-    msg = bot.reply_to(message, B(f"📜 𝐋𝐨𝐚𝐝𝐢𝐧𝐠 𝐥𝐨𝐠𝐬..."))
+    msg = bot.reply_to(message, B(f"📜 𝐋𝐨𝐚𝐝𝐢𝐧𝐠 𝐥𝐨𝐠𝐬 𝐟𝐨𝐫 `{file_name}`..."))
     try:
         AnimationManager.animate_logs(message.chat.id, msg.message_id)
     except Exception:
         pass
+    time.sleep(1)
     if not os.path.exists(log_path):
-        time.sleep(1)
         try:
-            bot.edit_message_text(B(f"📭 𝐍𝐨 𝐥𝐨𝐠𝐬 𝐟𝐨𝐮𝐧𝐝 𝐟𝐨𝐫 `{file_name}`"),
+            bot.edit_message_text(B(f"📭 𝐍𝐨 𝐥𝐨𝐠𝐬 𝐟𝐨𝐮𝐧𝐝 𝐟𝐨𝐫 `{file_name}`.\n\n𝐒𝐭𝐚𝐫𝐭 𝐭𝐡𝐞 𝐬𝐜𝐫𝐢𝐩𝐭 𝐟𝐢𝐫𝐬𝐭 𝐭𝐨 𝐠𝐞𝐧𝐞𝐫𝐚𝐭𝐞 𝐥𝐨𝐠𝐬."),
                                   message.chat.id, msg.message_id, parse_mode='Markdown',
                                   reply_markup=create_reply_keyboard_main_menu(user_id))
         except Exception:
@@ -1241,33 +1484,37 @@ def _show_logs(message, user_id, file_name):
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             log_content = f.read()
-        if len(log_content) > 3000:
-            log_content = "...\n" + log_content[-3000:]
-        time.sleep(1)
+        if not log_content.strip():
+            log_content = "(𝐋𝐨𝐠 𝐟𝐢𝐥𝐞 𝐢𝐬 𝐞𝐦𝐩𝐭𝐲)"
+        elif len(log_content) > 3500:
+            log_content = "...(𝐭𝐫𝐮𝐧𝐜𝐚𝐭𝐞𝐝)...\n" + log_content[-3500:]
+        running_status = "🟢 𝐑𝐮𝐧𝐧𝐢𝐧𝐠" if is_bot_running(user_id, file_name) else "🔴 𝐒𝐭𝐨𝐩𝐩𝐞𝐝"
+        header = f"📜 *𝐋𝐨𝐠𝐬 𝐟𝐨𝐫* `{file_name}` | {running_status}\n\n"
         try:
-            bot.edit_message_text(f"📜 𝐋𝐨𝐠𝐬 𝐟𝐨𝐫 `{file_name}`:\n```\n{log_content}\n```",
+            bot.edit_message_text(header + f"```\n{log_content}\n```",
                                   message.chat.id, msg.message_id, parse_mode='Markdown',
                                   reply_markup=create_reply_keyboard_main_menu(user_id))
         except Exception:
-            pass
+            # If message is too long, send as file
+            try:
+                from io import BytesIO
+                log_bytes = log_content.encode('utf-8')
+                bot.send_document(message.chat.id,
+                                  ('logs.txt', BytesIO(log_bytes)),
+                                  caption=f"📜 Logs for {file_name}")
+            except Exception as e2:
+                bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫 𝐬𝐞𝐧𝐝𝐢𝐧𝐠 𝐥𝐨𝐠𝐬: {str(e2)}"))
     except Exception as e:
         bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫 𝐫𝐞𝐚𝐝𝐢𝐧𝐠 𝐥𝐨𝐠𝐬: {str(e)}"))
 
-
 def _start_script_silent(user_id, file_name):
-    user_folder = get_user_folder(user_id)
-    file_path = os.path.join(user_folder, file_name)
-    if not os.path.exists(file_path):
+    file_path, run_dir, file_type = _get_run_params(user_id, file_name)
+    if not file_path or not os.path.exists(file_path):
         return
-    file_type = 'py'
-    for fname, ftype in user_files.get(user_id, []):
-        if fname == file_name:
-            file_type = ftype
-            break
-    if file_type == 'py':
-        threading.Thread(target=run_script_silent, args=(file_path, user_id, user_folder, file_name)).start()
+    if file_type in ('py', 'zip'):
+        threading.Thread(target=run_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
     elif file_type == 'js':
-        threading.Thread(target=run_js_script_silent, args=(file_path, user_id, user_folder, file_name)).start()
+        threading.Thread(target=run_js_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
 
 def _stop_script_silent(user_id, file_name):
     script_key = f"{user_id}_{file_name}"
@@ -1286,20 +1533,30 @@ def _delete_script_silent(user_id, file_name):
         os.remove(file_path)
     if os.path.exists(log_path):
         os.remove(log_path)
+    file_type = 'py'
+    for fname, ftype in user_files.get(user_id, []):
+        if fname == file_name:
+            file_type = ftype
+            break
+    if file_type == 'zip':
+        base_name = os.path.splitext(file_name)[0]
+        extract_dir = os.path.join(user_folder, base_name)
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
     remove_user_file_db(user_id, file_name)
 
-def run_script_silent(file_path, user_id, user_folder, file_name):
+def run_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
-    log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+    log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
     try:
         log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen([sys.executable, file_path], cwd=user_folder,
+        process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
                                    'script_key': script_key}
-        recovery_system.save_running_script(user_id, file_name, file_path, process.pid)
+        recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
     except:
         pass
@@ -1312,18 +1569,18 @@ def run_script_silent(file_path, user_id, user_folder, file_name):
         except:
             pass
 
-def run_js_script_silent(file_path, user_id, user_folder, file_name):
+def run_js_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
-    log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+    log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
     try:
         log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(['node', file_path], cwd=user_folder,
+        process = subprocess.Popen(['node', file_path], cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
                                    'script_key': script_key}
-        recovery_system.save_running_script(user_id, file_name, file_path, process.pid)
+        recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
     except:
         pass
@@ -1340,16 +1597,16 @@ def run_js_script_silent(file_path, user_id, user_folder, file_name):
 # ================================
 # 𝐒𝐂𝐑𝐈𝐏𝐓 𝐑𝐔𝐍𝐍𝐈𝐍𝐆 𝐅𝐔𝐍𝐂𝐓𝐈𝐎𝐍𝐒
 # ================================
-def run_script(file_path, user_id, user_folder, file_name, message):
+def run_script(file_path, user_id, run_dir, file_name, message):
     script_key = f"{user_id}_{file_name}"
     if script_key in bot_scripts:
         return
-    log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+    log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
     try:
         log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
     except Exception as e:
         try:
-            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫: {str(e)}"))
+            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫 𝐨𝐩𝐞𝐧𝐢𝐧𝐠 𝐥𝐨𝐠 𝐟𝐢𝐥𝐞: {str(e)}"))
         except Exception:
             pass
         return
@@ -1359,16 +1616,16 @@ def run_script(file_path, user_id, user_folder, file_name, message):
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen([sys.executable, file_path], cwd=user_folder,
+        process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    startupinfo=startupinfo, encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
                                    'script_key': script_key}
-        recovery_system.save_running_script(user_id, file_name, file_path, process.pid)
+        recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
-            bot.edit_message_text(B(f"🟢 `{file_name}` 𝐢𝐬 𝐧𝐨𝐰 𝐫𝐮𝐧𝐧𝐢𝐧𝐠!\n📋 𝐏𝐈𝐃: {process.pid}"),
+            bot.edit_message_text(B(f"🟢 `{file_name}` 𝐢𝐬 𝐧𝐨𝐰 𝐫𝐮𝐧𝐧𝐢𝐧𝐠!\n📋 𝐏𝐈𝐃: {process.pid}\n\n📜 𝐔𝐬𝐞 '📜 𝐋𝐨𝐠𝐬 {file_name}' 𝐭𝐨 𝐯𝐢𝐞𝐰 𝐨𝐮𝐭𝐩𝐮𝐭."),
                                   message.chat.id, message.message_id, parse_mode='Markdown',
                                   reply_markup=create_reply_keyboard_main_menu(user_id))
         except Exception:
@@ -1377,8 +1634,22 @@ def run_script(file_path, user_id, user_folder, file_name, message):
             process.wait()
             exit_code = process.returncode
             if exit_code != 0:
+                # Read last lines of log for the error
+                error_snippet = ""
                 try:
-                    bot.send_message(user_id, B(f"⚠️ `{file_name}` 𝐞𝐱𝐢𝐭𝐞𝐝 𝐰𝐢𝐭𝐡 𝐜𝐨𝐝𝐞 {exit_code}."))
+                    log_file.flush()
+                    with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as lf:
+                        lines = lf.readlines()
+                        error_snippet = ''.join(lines[-10:])
+                    if len(error_snippet) > 800:
+                        error_snippet = "..." + error_snippet[-800:]
+                except Exception:
+                    pass
+                err_msg = f"⚠️ `{file_name}` 𝐞𝐱𝐢𝐭𝐞𝐝 𝐰𝐢𝐭𝐡 𝐜𝐨𝐝𝐞 {exit_code}."
+                if error_snippet:
+                    err_msg += f"\n\n📋 *𝐋𝐚𝐬𝐭 𝐥𝐨𝐠 𝐥𝐢𝐧𝐞𝐬:*\n```\n{error_snippet}\n```"
+                try:
+                    bot.send_message(user_id, B(err_msg), parse_mode='Markdown')
                 except Exception:
                     pass
         except Exception:
@@ -1401,11 +1672,11 @@ def run_script(file_path, user_id, user_folder, file_name, message):
         except Exception:
             pass
 
-def run_js_script(file_path, user_id, user_folder, file_name, message):
+def run_js_script(file_path, user_id, run_dir, file_name, message):
     script_key = f"{user_id}_{file_name}"
     if script_key in bot_scripts:
         return
-    log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+    log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
     try:
         log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
     except Exception as e:
@@ -1420,13 +1691,13 @@ def run_js_script(file_path, user_id, user_folder, file_name, message):
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen(['node', file_path], cwd=user_folder,
+        process = subprocess.Popen(['node', file_path], cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    startupinfo=startupinfo, encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
                                    'script_key': script_key}
-        recovery_system.save_running_script(user_id, file_name, file_path, process.pid)
+        recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
             bot.edit_message_text(B(f"🟢 `{file_name}` 𝐢𝐬 𝐧𝐨𝐰 𝐫𝐮𝐧𝐧𝐢𝐧𝐠!\n📋 𝐏𝐈𝐃: {process.pid}"),
@@ -1474,14 +1745,17 @@ def create_manage_scripts_keyboard(user_id):
     for fname, ftype in files:
         running = is_bot_running(user_id, fname)
         status_text = "🟢 Running" if running else "🔴 Stopped"
-        markup.add(types.InlineKeyboardButton(f"📂 {fname} | {status_text}", callback_data=f"info_{fname}"))
+        type_icon = "📦" if ftype == 'zip' else ("🐍" if ftype == 'py' else "⬡")
+        markup.add(types.InlineKeyboardButton(f"{type_icon} {fname} | {status_text}", callback_data=f"info_{fname}"))
         row = []
         if running:
             row.append(types.InlineKeyboardButton("⏹ Stop", callback_data=f"stop_script_{fname}"))
+            row.append(types.InlineKeyboardButton("🔄 Restart", callback_data=f"restart_script_{fname}"))
         else:
             row.append(types.InlineKeyboardButton("▶ Start", callback_data=f"start_script_{fname}"))
         row.append(types.InlineKeyboardButton("🗑 Delete", callback_data=f"delete_script_{fname}"))
         markup.add(*row)
+        markup.add(types.InlineKeyboardButton("📜 View Logs", callback_data=f"logs_script_{fname}"))
         markup.add(types.InlineKeyboardButton("━━━━━━━━━━━━━━", callback_data="none"))
     markup.add(types.InlineKeyboardButton("🔄 Refresh List", callback_data="manage_scripts"))
     return markup
@@ -1489,7 +1763,7 @@ def create_manage_scripts_keyboard(user_id):
 def show_manage_scripts(message, user_id):
     files = user_files.get(user_id, [])
     if not files:
-        bot.reply_to(message, B("📂 𝐍𝐨 𝐬𝐜𝐫𝐢𝐩𝐭𝐬 𝐮𝐩𝐥𝐨𝐚𝐝𝐞𝐝 𝐲𝐞𝐭.\n\n📤 𝐒𝐞𝐧𝐝 𝐚 .𝐩𝐲 𝐨𝐫 .𝐣𝐬 𝐟𝐢𝐥𝐞 𝐭𝐨 𝐮𝐩𝐥𝐨𝐚𝐝!"),
+        bot.reply_to(message, B("📂 𝐍𝐨 𝐬𝐜𝐫𝐢𝐩𝐭𝐬 𝐮𝐩𝐥𝐨𝐚𝐝𝐞𝐝 𝐲𝐞𝐭.\n\n📤 𝐒𝐞𝐧𝐝 𝐚 .𝐩𝐲, .𝐣𝐬 𝐨𝐫 .𝐳𝐢𝐩 𝐟𝐢𝐥𝐞 𝐭𝐨 𝐮𝐩𝐥𝐨𝐚𝐝!"),
                     reply_markup=create_reply_keyboard_main_menu(user_id))
         return
     kb = create_manage_scripts_keyboard(user_id)
@@ -1546,6 +1820,40 @@ def callback_router(call):
                 time.sleep(1)
                 update_manage_scripts_message(call, user_id)
 
+        elif data.startswith('restart_script_'):
+            file_name = data.replace('restart_script_', '')
+            bot.answer_callback_query(call.id, "🔄 Restarting...")
+            _stop_script_silent(user_id, file_name)
+            time.sleep(1)
+            _start_script_silent(user_id, file_name)
+            time.sleep(1)
+            update_manage_scripts_message(call, user_id)
+
+        elif data.startswith('logs_script_'):
+            file_name = data.replace('logs_script_', '')
+            bot.answer_callback_query(call.id, "📜 Loading logs...")
+            user_folder = get_user_folder(user_id)
+            log_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+            if not os.path.exists(log_path):
+                bot.send_message(call.message.chat.id, B(f"📭 𝐍𝐨 𝐥𝐨𝐠𝐬 𝐟𝐨𝐮𝐧𝐝 𝐟𝐨𝐫 `{file_name}`.\n𝐒𝐭𝐚𝐫𝐭 𝐭𝐡𝐞 𝐬𝐜𝐫𝐢𝐩𝐭 𝐟𝐢𝐫𝐬𝐭."), parse_mode='Markdown')
+            else:
+                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    log_content = f.read()
+                if not log_content.strip():
+                    log_content = "(𝐋𝐨𝐠 𝐟𝐢𝐥𝐞 𝐢𝐬 𝐞𝐦𝐩𝐭𝐲)"
+                elif len(log_content) > 3500:
+                    log_content = "...(𝐭𝐫𝐮𝐧𝐜𝐚𝐭𝐞𝐝)...\n" + log_content[-3500:]
+                running_status = "🟢 𝐑𝐮𝐧𝐧𝐢𝐧𝐠" if is_bot_running(user_id, file_name) else "🔴 𝐒𝐭𝐨𝐩𝐩𝐞𝐝"
+                try:
+                    bot.send_message(call.message.chat.id,
+                                     f"📜 *𝐋𝐨𝐠𝐬 𝐟𝐨𝐫* `{file_name}` | {running_status}\n\n```\n{log_content}\n```",
+                                     parse_mode='Markdown')
+                except Exception:
+                    from io import BytesIO
+                    bot.send_document(call.message.chat.id,
+                                      ('logs.txt', BytesIO(log_content.encode('utf-8'))),
+                                      caption=f"📜 Logs for {file_name}")
+
         elif data.startswith('delete_script_'):
             file_name = data.replace('delete_script_', '')
             bot.answer_callback_query(call.id, "🗑 Deleting...")
@@ -1577,12 +1885,10 @@ def callback_router(call):
             try:
                 if recovered:
                     bot.edit_message_text(B(f"✅ 𝐑𝐞𝐜𝐨𝐯𝐞𝐫𝐞𝐝: {len(recovered)} 𝐬𝐜𝐫𝐢𝐩𝐭(𝐬)"),
-                                          call.message.chat.id, msg.message_id,
-                                          reply_markup=create_reply_keyboard_main_menu(user_id))
+                                          call.message.chat.id, msg.message_id)
                 else:
                     bot.edit_message_text(B("📭 𝐍𝐨 𝐬𝐜𝐫𝐢𝐩𝐭𝐬 𝐭𝐨 𝐫𝐞𝐜𝐨𝐯𝐞𝐫."),
-                                          call.message.chat.id, msg.message_id,
-                                          reply_markup=create_reply_keyboard_main_menu(user_id))
+                                          call.message.chat.id, msg.message_id)
             except Exception:
                 pass
 
@@ -1606,7 +1912,7 @@ def callback_router(call):
             bot.answer_callback_query(call.id, f"📂 {file_name}")
 
         elif data == 'none':
-            bot.answer_callback_query(call.id, "━━━━━━━━━━━━━━")
+            bot.answer_callback_query(call.id, "")
 
         else:
             bot.answer_callback_query(call.id, "🔍 Unknown action")
@@ -1630,7 +1936,8 @@ def callback_router(call):
     message.text == B("👤 𝐏𝐫𝐨𝐟𝐢𝐥𝐞") or
     message.text == B("📦 𝐌𝐨𝐝𝐮𝐥𝐞") or
     message.text == B("🔄 𝐑𝐞𝐜𝐨𝐯𝐞𝐫") or
-    message.text == B("🚀 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 𝐁𝐨𝐭")
+    message.text == B("🚀 𝐑𝐞𝐬𝐭𝐚𝐫𝐭 𝐁𝐨𝐭") or
+    message.text == B("👑 𝐀𝐝𝐦𝐢𝐧")
 ))
 def handle_main_menu_message(message):
     user_id = message.from_user.id
@@ -1638,7 +1945,7 @@ def handle_main_menu_message(message):
     text = message.text
 
     if text == B("📤 𝐔𝐩𝐥𝐨𝐚𝐝"):
-        bot.reply_to(message, B("📤 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 .𝐩𝐲 𝐨𝐫 .𝐣𝐬 𝐟𝐢𝐥𝐞 𝐧𝐨𝐰!\n\n📋 𝐒𝐮𝐩𝐩𝐨𝐫𝐭𝐞𝐝: .𝐩𝐲, .𝐣𝐬, .𝐳𝐢𝐩\n\n👉 𝐓𝐚𝐩 📎 𝐚𝐭𝐭𝐚𝐜𝐡𝐦𝐞𝐧𝐭 → 𝐅𝐢𝐥𝐞"),
+        bot.reply_to(message, B("📤 𝐒𝐞𝐧𝐝 𝐲𝐨𝐮𝐫 𝐟𝐢𝐥𝐞 𝐧𝐨𝐰!\n\n📋 𝐒𝐮𝐩𝐩𝐨𝐫𝐭𝐞𝐝: .𝐩𝐲, .𝐣𝐬, .𝐳𝐢𝐩\n\n📦 𝐙𝐈𝐏: 𝐏𝐮𝐭 𝐦𝐚𝐢𝐧.𝐩𝐲 + 𝐦𝐨𝐝𝐮𝐥𝐞𝐬 𝐢𝐧 𝐚 .𝐳𝐢𝐩 𝐟𝐢𝐥𝐞\n\n👉 𝐓𝐚𝐩 📎 𝐚𝐭𝐭𝐚𝐜𝐡𝐦𝐞𝐧𝐭 → 𝐅𝐢𝐥𝐞"),
                    reply_markup=create_reply_keyboard_main_menu(user_id))
 
     elif text == B("📂 𝐌𝐚𝐧𝐚𝐠𝐞 𝐒𝐜𝐫𝐢𝐩𝐭𝐬"):
@@ -1662,7 +1969,12 @@ def handle_main_menu_message(message):
 📦 𝐓𝐞𝐥𝐞𝐛𝐨𝐭, 𝐑𝐞𝐪𝐮𝐞𝐬𝐭𝐬, 𝐏𝐬𝐮𝐭𝐢𝐥, 𝐅𝐥𝐚𝐬𝐤
 📦 𝐐𝐫𝐜𝐨𝐝𝐞, 𝐏𝐢𝐥𝐥𝐨𝐰, 𝐂𝐫𝐲𝐩𝐭𝐨𝐠𝐫𝐚𝐩𝐡𝐲, 𝐏𝐲𝐌𝐨𝐧𝐠𝐨
 
-*𝐔𝐩𝐥𝐨𝐚𝐝 𝐚 𝐬𝐜𝐫𝐢𝐩𝐭 𝐭𝐨 𝐚𝐮𝐭𝐨-𝐢𝐧𝐬𝐭𝐚𝐥𝐥 𝐝𝐞𝐩𝐞𝐧𝐝𝐞𝐧𝐜𝐢𝐞𝐬!*
+*𝐙𝐈𝐏 𝐒𝐮𝐩𝐩𝐨𝐫𝐭:*
+📦 𝐔𝐩𝐥𝐨𝐚𝐝 𝐚 .𝐳𝐢𝐩 𝐰𝐢𝐭𝐡 𝐦𝐚𝐢𝐧.𝐩𝐲 + 𝐦𝐨𝐝𝐮𝐥𝐞𝐬
+📦 𝐁𝐨𝐭 𝐚𝐮𝐭𝐨-𝐟𝐢𝐧𝐝𝐬 𝐦𝐚𝐢𝐧.𝐩𝐲 𝐚𝐧𝐝 𝐫𝐮𝐧𝐬 𝐢𝐭
+📦 𝐈𝐧𝐜𝐥𝐮𝐝𝐞 𝐫𝐞𝐪𝐮𝐢𝐫𝐞𝐦𝐞𝐧𝐭𝐬.𝐭𝐱𝐭 𝐢𝐧 𝐙𝐈𝐏
+
+*𝐀𝐮𝐭𝐨-𝐢𝐧𝐬𝐭𝐚𝐥𝐥:*
 *𝐀𝐧𝐲 𝐩𝐢𝐩 𝐩𝐚𝐜𝐤𝐚𝐠𝐞 𝐰𝐢𝐥𝐥 𝐛𝐞 𝐢𝐧𝐬𝐭𝐚𝐥𝐥𝐞𝐝 𝐚𝐮𝐭𝐨𝐦𝐚𝐭𝐢𝐜𝐚𝐥𝐥𝐲.*"""
         msg = bot.reply_to(message, module_text, parse_mode='Markdown',
                            reply_markup=create_reply_keyboard_main_menu(user_id))
@@ -1703,6 +2015,33 @@ def handle_main_menu_message(message):
         time.sleep(2.5)
         threading.Thread(target=send_restart_notification).start()
         os.execl(sys.executable, sys.executable, *sys.argv)
+
+    elif text == B("👑 𝐀𝐝𝐦𝐢𝐧"):
+        if user_id != OWNER_ID:
+            bot.reply_to(message, B("🔒 𝐎𝐰𝐧𝐞𝐫 𝐨𝐧𝐥𝐲."))
+            return
+        auth_count = len(authorized_users)
+        total_files = sum(len(v) for v in user_files.values())
+        running_count = len(bot_scripts)
+        ram_pct = psutil.virtual_memory().percent
+        cpu_pct = psutil.cpu_percent(interval=1)
+        admin_text = f"""╔══════════════════════════════════╗
+║    👑 𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋               ║
+╚══════════════════════════════════╝
+
+👥 *𝐀𝐮𝐭𝐡𝐨𝐫𝐢𝐳𝐞𝐝 𝐔𝐬𝐞𝐫𝐬:* {auth_count}
+📂 *𝐓𝐨𝐭𝐚𝐥 𝐅𝐢𝐥𝐞𝐬:* {total_files}
+🚀 *𝐑𝐮𝐧𝐧𝐢𝐧𝐠:* {running_count}
+💾 *𝐑𝐀𝐌:* {ram_pct:.0f}%
+⚙ *𝐂𝐏𝐔:* {cpu_pct:.0f}%
+
+*𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐬:*
+/adduser <id> — Grant access
+/removeuser <id> — Revoke access
+/listusers — List authorized users
+/logs <file> — View any user's logs"""
+        bot.reply_to(message, admin_text, parse_mode='Markdown',
+                     reply_markup=create_reply_keyboard_main_menu(user_id))
 
 
 @bot.message_handler(func=lambda message: message.text and (
@@ -1773,11 +2112,12 @@ def startup_recovery():
 # ================================
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 HOSTING BOT VERSION 4.0")
+    logger.info("🚀 HOSTING BOT VERSION 4.1")
     logger.info("🗄️ Database: MongoDB")
     logger.info("📊 Auto-Recovery: Enabled")
+    logger.info("🔒 Access Control: Admin-Only")
     logger.info(f"👑 Owner ID: {OWNER_ID}")
-    logger.info(f"👥 Active Users: {len(active_users)}")
+    logger.info(f"👥 Authorized Users: {len(authorized_users)}")
     logger.info(f"📁 Total Files: {sum(len(files) for files in user_files.values())}")
     try:
         bot_username = bot.get_me().username
