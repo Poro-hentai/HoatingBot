@@ -83,7 +83,7 @@ OWNER_ID = int(os.environ.get('OWNER_ID', str(OWNER_ID_HARDCODED)))
 
 # ── MONGODB ─────────────────────────────────────────────────────────────────────
 # MongoDB connection string — set here or override with MONGODB_URI env var
-MONGODB_URI_DEFAULT = 'mongodb+srv://Ayane:Shadow123@cluster0.mbtyjwq.mongodb.net/?appName=Cluster0'
+MONGODB_URI_DEFAULT = ''
 MONGODB_URI = os.environ.get('MONGODB_URI', MONGODB_URI_DEFAULT)
 
 # ── VALIDATION ──────────────────────────────────────────────────────────────────
