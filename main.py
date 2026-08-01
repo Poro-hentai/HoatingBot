@@ -78,7 +78,7 @@ OWNER_ID_HARDCODED = 0  # <- Paste your Telegram user ID here
 OWNER_ID = int(os.environ.get('OWNER_ID', str(OWNER_ID_HARDCODED)))
 
 # ── MONGODB ─────────────────────────────────────────────────────────────────────
-MONGODB_URI_DEFAULT = ''
+MONGODB_URI_DEFAULT = 'mongodb+srv://kurumi:Shadow123@cluster0.lnd1uue.mongodb.net/?appName=Cluster0'
 MONGODB_URI = os.environ.get('MONGODB_URI', MONGODB_URI_DEFAULT)
 
 # ── VALIDATION ──────────────────────────────────────────────────────────────────
@@ -492,7 +492,7 @@ class AutoRecoverySystem:
                 return
             log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
             log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-            process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
+            process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
                                        stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                        encoding='utf-8', errors='ignore')
             bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
@@ -810,7 +810,7 @@ def extract_and_setup_zip(zip_path, user_folder, zip_name):
         if os.path.exists(req_path):
             try:
                 subprocess.run(
-                    [sys.executable, '-m', 'pip', 'install', '-r', req_path, '--quiet', '--break-system-packages'],
+                    ['uv', 'pip', 'install', '-r', req_path, '--python', sys.executable, '--quiet'],
                     capture_output=True, text=True, check=False, timeout=120
                 )
                 logger.info(f"✅ Installed requirements.txt for {zip_name}")
@@ -858,6 +858,13 @@ TELEGRAM_MODULES = {
     'pymongo': 'pymongo',
     'redis': 'redis',
     'sqlalchemy': 'SQLAlchemy',
+    'aiosqlite': 'aiosqlite',
+    'curl_cffi': 'curl_cffi',
+    'httpx': 'httpx',
+    'httpcore': 'httpcore',
+    'tgcrypto': 'TgCrypto',
+    'nacl': 'PyNaCl',
+    'magic_filter': 'magic-filter',
     'asyncio': '', 'json': '', 'os': '', 'sys': '', 'time': '',
     're': '', 'math': '', 'random': '', 'datetime': '', 'collections': '',
     'itertools': '', 'functools': '', 'pathlib': '', 'subprocess': '',
@@ -900,7 +907,103 @@ TELEGRAM_MODULES = {
     'PIL.ImageDraw': 'Pillow',
     'PIL.ImageFont': 'Pillow',
     'dnspython': 'dnspython',
+    'dns': 'dnspython',
 }
+
+def _uv_install(package_name):
+    """Install a package using uv (works in Nix environment)."""
+    try:
+        result = subprocess.run(
+            ['uv', 'pip', 'install', package_name, '--python', sys.executable, '--quiet'],
+            capture_output=True, text=True, check=False, timeout=120
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ Installed: {package_name}")
+            return True
+        else:
+            logger.warning(f"⚠️ uv install failed for {package_name}: {result.stderr[:200]}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ uv install error for {package_name}: {e}")
+        return False
+
+def sanitize_python_imports(file_path):
+    """
+    Fix corrupted module names in import lines.
+
+    Some tools (e.g. Brevistay watermarking) inject garbage into module paths:
+      aiogram.fsm.storage.meBREVITOMATIONbotmory  →  aiogram.fsm.storage.memory
+
+    The injection pattern:
+      original word (e.g. 'memory')
+      → split at some point ('me' + 'mory')
+      → insert UPPERCASE_BLOCK + lowercase_tag ('BREVITOMATIONbot')
+      → result: 'meBREVITOMATIONbotmory'
+
+    Strategy for each dotted segment in a module path:
+      1. If segment contains 4+ consecutive uppercase chars (strong signal of injection):
+         a. Remove all uppercase chars      →  'mebotmory'
+         b. Remove known lowercase tags     →  'memory'
+      2. Otherwise leave segment unchanged.
+    """
+    # Lowercase tags that watermarking tools inject alongside uppercase blocks
+    INJECTION_TAGS = ['bot', 'srv', 'api', 'app', 'pro', 'key']
+
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        def clean_segment(seg):
+            # Only treat as corrupted if there's a long uppercase run (4+ chars)
+            # embedded in an otherwise lowercase word — avoids breaking CamelCase
+            # class names like 'OpenSSL' (SSL = 3 chars) or 'Crypto' (C = 1 char).
+            if re.search(r'[A-Z]{4,}', seg) and any(c.islower() for c in seg):
+                # Step 1: strip all uppercase chars
+                cleaned = re.sub(r'[A-Z]+', '', seg)
+                # Step 2: remove known watermark injection words (lowercase tags)
+                for tag in INJECTION_TAGS:
+                    cleaned = cleaned.replace(tag, '')
+                if cleaned:
+                    return cleaned
+            return seg
+
+        def clean_module_path(path):
+            parts = path.split('.')
+            return '.'.join(clean_segment(p) for p in parts)
+
+        def fix_import_line(line):
+            m = re.match(r'^(\s*import\s+)([a-zA-Z0-9_.]+)(.*)', line)
+            if m:
+                fixed = clean_module_path(m.group(2))
+                return m.group(1) + fixed + m.group(3)
+            m = re.match(r'^(\s*from\s+)([a-zA-Z0-9_.]+)(\s+import.*)', line)
+            if m:
+                fixed = clean_module_path(m.group(2))
+                return m.group(1) + fixed + m.group(3)
+            return line
+
+        lines = content.split('\n')
+        fixed_lines = []
+        changed = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                fixed = fix_import_line(line)
+                if fixed != line:
+                    logger.info(f"🔧 Sanitized: '{line.strip()}' → '{fixed.strip()}'")
+                    changed = True
+                fixed_lines.append(fixed)
+            else:
+                fixed_lines.append(line)
+
+        if changed:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(fixed_lines))
+            logger.info(f"✅ Sanitized corrupted imports in {os.path.basename(file_path)}")
+        return changed
+    except Exception as e:
+        logger.error(f"❌ Error sanitizing {file_path}: {e}")
+        return False
 
 def auto_generate_requirements(file_path, user_folder):
     try:
@@ -932,7 +1035,7 @@ def auto_generate_requirements(file_path, user_folder):
         return []
 
 def auto_setup_user_env_from_path(file_path, run_dir):
-    """Detect and install imports from a specific python file."""
+    """Detect and install missing imports from a specific python file using uv."""
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -948,23 +1051,24 @@ def auto_setup_user_env_from_path(file_path, run_dir):
             except ImportError:
                 pip_name = TELEGRAM_MODULES.get(mod.lower(), mod)
                 if pip_name:
-                    subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name, '--quiet', '--break-system-packages'],
-                                   capture_output=True, text=True, check=False)
+                    _uv_install(pip_name)
     except Exception as e:
         logger.error(f"❌ Error in auto setup: {e}")
 
 def auto_setup_user_env(user_id, file_name):
+    """Scan uploaded file for imports and install missing packages using uv."""
     user_folder = get_user_folder(user_id)
     file_path = os.path.join(user_folder, file_name)
     requirements = auto_generate_requirements(file_path, user_folder)
+    installed = []
     if requirements:
         for pip_name in sorted(set(requirements)):
             try:
-                subprocess.run([sys.executable, '-m', 'pip', 'install', pip_name, '--quiet', '--break-system-packages'],
-                               capture_output=True, text=True, check=False)
+                if _uv_install(pip_name):
+                    installed.append(pip_name)
             except Exception:
                 pass
-    return requirements
+    return installed
 
 
 # ================================
@@ -1068,6 +1172,7 @@ def send_help(message):
 /adduser <user_id> — 𝐆𝐫𝐚𝐧𝐭 𝐚𝐜𝐜𝐞𝐬𝐬
 /removeuser <user_id> — 𝐑𝐞𝐯𝐨𝐤𝐞 𝐚𝐜𝐜𝐞𝐬𝐬
 /listusers — 𝐋𝐢𝐬𝐭 𝐚𝐮𝐭𝐡𝐨𝐫𝐢𝐳𝐞𝐝 𝐮𝐬𝐞𝐫𝐬
+/install <pkg> — 𝐌𝐚𝐧𝐮𝐚𝐥𝐥𝐲 𝐢𝐧𝐬𝐭𝐚𝐥𝐥 𝐩𝐚𝐜𝐤𝐚𝐠𝐞𝐬
 
 *𝐇𝐨𝐰 𝐭𝐨 𝐮𝐬𝐞:*
 1️⃣ 𝐓𝐚𝐩 📎 𝐚𝐭𝐭𝐚𝐜𝐡𝐦𝐞𝐧𝐭 → 𝐅𝐢𝐥𝐞
@@ -1163,6 +1268,42 @@ def cmd_logs(message):
     file_name = args[1].strip()
     _show_logs(message, user_id, file_name)
 
+@bot.message_handler(commands=['install'])
+def cmd_install(message):
+    """Manually install pip packages: /install <pkg1> <pkg2> ..."""
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "🔒 Owner only.")
+        return
+    args = message.text.split()[1:]
+    if not args:
+        bot.reply_to(message,
+            "❓ *Usage:* `/install <package1> <package2> ...`\n"
+            "Example: `/install pyrogram aiogram aiohttp`",
+            parse_mode='Markdown')
+        return
+    msg = bot.reply_to(message, B(f"📦 𝐈𝐧𝐬𝐭𝐚𝐥𝐥𝐢𝐧𝐠: {', '.join(args)}..."))
+    try:
+        AnimationManager.animate_install(message.chat.id, msg.message_id)
+    except Exception:
+        pass
+
+    def _do_install():
+        results = []
+        for pkg in args:
+            ok = _uv_install(pkg)
+            results.append(f"{'✅' if ok else '❌'} `{pkg}`")
+        result_text = (
+            f"📦 *𝐈𝐧𝐬𝐭𝐚𝐥𝐥 𝐑𝐞𝐬𝐮𝐥𝐭𝐬:*\n" + '\n'.join(results)
+        )
+        try:
+            bot.edit_message_text(result_text, message.chat.id, msg.message_id,
+                                  parse_mode='Markdown',
+                                  reply_markup=create_reply_keyboard_main_menu(message.from_user.id))
+        except Exception:
+            pass
+
+    threading.Thread(target=_do_install, daemon=True).start()
+
 # ================================
 # 𝐀𝐃𝐌𝐈𝐍 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒
 # ================================
@@ -1256,11 +1397,15 @@ def handle_document(message):
 
         if file_ext == '.py':
             file_type = 'py'
+            # ✅ Save to DB FIRST so file appears in Manage Scripts immediately
+            save_user_file_db(user_id, file_name, file_type)
+            # Sanitize corrupted imports (e.g. injected garbage text in module names)
             try:
-                auto_setup_user_env(user_id, file_name)
+                sanitize_python_imports(file_path)
             except Exception:
                 pass
-            save_user_file_db(user_id, file_name, file_type)
+            # Install missing packages in background thread so UI doesn't freeze
+            threading.Thread(target=auto_setup_user_env, args=(user_id, file_name), daemon=True).start()
 
         elif file_ext == '.js':
             file_type = 'js'
@@ -1268,7 +1413,7 @@ def handle_document(message):
 
         elif file_ext == '.zip':
             # Extract and find main.py
-            status_msg = bot.edit_message_text(
+            bot.edit_message_text(
                 B("📦 𝐄𝐱𝐭𝐫𝐚𝐜𝐭𝐢𝐧𝐠 𝐙𝐈𝐏 𝐚𝐧𝐝 𝐬𝐜𝐚𝐧𝐧𝐢𝐧𝐠 𝐟𝐨𝐫 𝐦𝐚𝐢𝐧.𝐩𝐲..."),
                 message.chat.id, msg.message_id
             )
@@ -1280,7 +1425,12 @@ def handle_document(message):
                 )
                 return
             file_type = 'zip'
-            # Store the path to main.py in extra_path, run_dir in file type metadata
+            # Sanitize the extracted main.py too
+            try:
+                sanitize_python_imports(main_py_path)
+            except Exception:
+                pass
+            # Save to DB with path info
             save_user_file_db(user_id, file_name, file_type, extra_path=f"{main_py_path}|{run_dir}")
 
         time.sleep(2)
@@ -1550,7 +1700,7 @@ def run_script_silent(file_path, user_id, run_dir, file_name):
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
     try:
         log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
+        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
@@ -1597,6 +1747,22 @@ def run_js_script_silent(file_path, user_id, run_dir, file_name):
 # ================================
 # 𝐒𝐂𝐑𝐈𝐏𝐓 𝐑𝐔𝐍𝐍𝐈𝐍𝐆 𝐅𝐔𝐍𝐂𝐓𝐈𝐎𝐍𝐒
 # ================================
+def _build_py_cmd(file_path):
+    """
+    Build the command to run a Python script.
+    Uses an inline bootstrap that creates an asyncio event loop before importing
+    the target script — fixes pyrogram/aiogram crashes on Python 3.10+ where
+    get_event_loop() no longer auto-creates a loop.
+    """
+    bootstrap = (
+        "import asyncio, sys, os;"
+        "asyncio.set_event_loop(asyncio.new_event_loop());"
+        f"sys.argv = [r'{file_path}'];"
+        f"exec(compile(open(r'{file_path}','rb').read(), r'{file_path}', 'exec'),"
+        f" {{'__name__': '__main__', '__file__': r'{file_path}'}})"
+    )
+    return [sys.executable, '-c', bootstrap]
+
 def run_script(file_path, user_id, run_dir, file_name, message):
     script_key = f"{user_id}_{file_name}"
     if script_key in bot_scripts:
@@ -1616,7 +1782,7 @@ def run_script(file_path, user_id, run_dir, file_name, message):
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen([sys.executable, file_path], cwd=run_dir,
+        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
                                    stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                                    startupinfo=startupinfo, encoding='utf-8', errors='ignore')
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
