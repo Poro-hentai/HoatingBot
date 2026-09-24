@@ -16,3 +16,4 @@ aiohttp
 python-dotenv
 motor
 APScheduler
+ijson
