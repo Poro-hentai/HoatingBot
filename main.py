@@ -36,8 +36,8 @@ from pymongo import MongoClient, ReturnDocument
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOG = logging.getLogger("firebase-bot")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8919636165:AAHc8RQn5VLVUIa4ZleMhE-pbOz6Vhyy8Lw").strip()
-MONGO_URI = os.getenv("MONGODB_URI", "mongodb+srv://Ren:Shadow123@cluster0.k7muifc.mongodb.net/?appName=Cluster0").strip()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8216354175:AAH_pilA68YbcWAE1vgXcwmlZK92loHaJvU").strip()
+MONGO_URI = os.getenv("MONGODB_URI", "mongodb+srv://Tokishaki:Shadow123@cluster0.2dtvfy1.mongodb.net/?appName=Cluster0").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_ID", "5759232282").split(",") if x.strip().isdigit()}
 SUPPORT_URL = os.getenv("SUPPORT_GROUP_URL", "https://t.me/+bOhnrl3FeJk5ODll").strip()
 
