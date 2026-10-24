@@ -6,6 +6,7 @@
 import subprocess
 import sys
 import os
+import ast
 
 # ✅ Packages pre-installed via Replit package manager (pip not available in Nix)
 _pkg_map = {"pyTelegramBotAPI": "telebot", "Pillow": "PIL", "dnspython": "dns"}
@@ -100,6 +101,8 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'hosting_uploads')
 HOSTING_DATA_DIR = os.path.join(BASE_DIR, 'hosting_data')
 RUNNING_SCRIPTS_DB = os.path.join(HOSTING_DATA_DIR, 'running_scripts.json')
+AUTO_START_DB = os.path.join(HOSTING_DATA_DIR, 'auto_start_scripts.json')
+MAX_SCRIPT_LOG_BYTES = 512 * 1024
 
 # 𝐓𝐈𝐄𝐑 𝐒𝐘𝐒𝐓𝐄𝐌
 TIER_SYSTEM = {
@@ -134,12 +137,69 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+auto_start_scripts = set()
+auto_start_lock = threading.Lock()
+script_starting = set()
+script_start_lock = threading.Lock()
+auto_start_last_attempt = {}
+
+def load_auto_start_scripts():
+    try:
+        with open(AUTO_START_DB, 'r', encoding='utf-8') as data_file:
+            data = json.load(data_file)
+        if not isinstance(data, dict) or not isinstance(data.get('scripts', []), list):
+            raise ValueError("Invalid auto-start settings format")
+        return {
+            (int(item['user_id']), item['file_name'])
+            for item in data.get('scripts', [])
+            if isinstance(item, dict) and 'user_id' in item and isinstance(item.get('file_name'), str)
+        }
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        logger.error(f"❌ Error loading auto-start settings: {e}")
+        return set()
+
+auto_start_scripts = load_auto_start_scripts()
+
+def set_auto_start(user_id, file_name, enabled):
+    with auto_start_lock:
+        updated = set(auto_start_scripts)
+        script = (int(user_id), file_name)
+        if enabled:
+            updated.add(script)
+        else:
+            updated.discard(script)
+        temporary_path = AUTO_START_DB + '.tmp'
+        try:
+            with open(temporary_path, 'w', encoding='utf-8') as data_file:
+                json.dump(
+                    {'scripts': [
+                        {'user_id': uid, 'file_name': name}
+                        for uid, name in sorted(updated)
+                    ]},
+                    data_file,
+                    separators=(',', ':')
+                )
+            os.replace(temporary_path, AUTO_START_DB)
+        except OSError as e:
+            logger.error(f"❌ Error saving auto-start settings: {e}")
+            try:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                logger.exception("❌ Could not remove temporary auto-start data file")
+            return False
+        auto_start_scripts.clear()
+        auto_start_scripts.update(updated)
+        return True
+
 
 # ================================
 # 𝐀𝐂𝐂𝐄𝐒𝐒 𝐂𝐎𝐍𝐓𝐑𝐎𝐋 𝐌𝐈𝐃𝐃𝐋𝐄𝐖𝐀𝐑𝐄
 # ================================
 class AdminOnlyMiddleware(BaseMiddleware):
-    """Only owner + explicitly authorized users can use this bot."""
+    """Only the configured owner can use this bot."""
     def __init__(self):
         super().__init__()
         self.update_types = ['message', 'callback_query']
@@ -152,17 +212,13 @@ class AdminOnlyMiddleware(BaseMiddleware):
         # Allow owner always
         if uid == OWNER_ID:
             return None
-        # Allow explicitly authorized users
-        if uid in authorized_users:
-            return None
-        # Block everyone else
         try:
-            if hasattr(update, 'message') or hasattr(update, 'text') or hasattr(update, 'document'):
-                bot.reply_to(update, "🔒 *Access Denied*\n\nThis bot is private. Contact the admin to get access.", parse_mode='Markdown')
+            if hasattr(update, 'data'):
+                bot.answer_callback_query(update.id, "🔒 Owner only.", show_alert=True)
             else:
-                bot.answer_callback_query(update.id, "🔒 Access Denied. Contact admin.", show_alert=True)
-        except Exception:
-            pass
+                bot.reply_to(update, "🔒 *Access Denied*\n\nThis bot is private. Contact the admin to get access.", parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"Could not notify unauthorized user {uid}: {e}")
         return CancelUpdate()
 
     def post_process(self, update, data, exception=None):
@@ -428,7 +484,7 @@ class AutoRecoverySystem:
                 "run_dir": run_dir or os.path.dirname(file_path)
             })
             with open(self.running_scripts_file, 'w') as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, separators=(',', ':'))
         except Exception as e:
             logger.error(f"❌ Error saving running script: {e}")
 
@@ -440,44 +496,32 @@ class AutoRecoverySystem:
                 data["running_scripts"] = [s for s in data["running_scripts"]
                                            if not (s["user_id"] == user_id and s["file_name"] == file_name)]
                 with open(self.running_scripts_file, 'w') as f:
-                    json.dump(data, f, indent=4)
+                    json.dump(data, f, separators=(',', ':'))
         except Exception as e:
             logger.error(f"❌ Error removing running script: {e}")
 
     def recover_all_scripts(self):
         try:
-            if not os.path.exists(self.running_scripts_file):
-                return []
-            with open(self.running_scripts_file, 'r') as f:
-                data = json.load(f)
+            data = {"running_scripts": []}
+            if os.path.exists(self.running_scripts_file):
+                with open(self.running_scripts_file, 'r') as f:
+                    data = json.load(f)
+            scripts = {
+                (int(script["user_id"]), script["file_name"])
+                for script in data.get("running_scripts", [])
+            }
+            scripts.update(auto_start_scripts)
             recovered = []
-            for script in data.get("running_scripts", []):
+            for user_id, file_name in scripts:
                 try:
-                    user_id = script["user_id"]
-                    file_name = script["file_name"]
-                    file_path = script["file_path"]
-                    run_dir = script.get("run_dir", os.path.dirname(file_path))
-                    if not os.path.exists(file_path):
-                        continue
                     user_has_file = any(fname == file_name for fname, _ in user_files.get(user_id, []))
                     if not user_has_file:
                         continue
                     tier = get_user_tier(user_id)
                     if not TIER_SYSTEM[tier]['auto_restart']:
                         continue
-                    file_ext = os.path.splitext(file_name)[1].lower()
-                    if file_ext == '.py':
-                        threading.Thread(target=self._restart_py_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    elif file_ext == '.js':
-                        threading.Thread(target=self._restart_js_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    elif file_ext == '.zip':
-                        # For zip, file_path points to main.py inside extracted folder
-                        threading.Thread(target=self._restart_py_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    recovered.append({"user_id": user_id, "file_name": file_name, "status": "recovering"})
-                    time.sleep(1)
+                    if _start_script_silent(user_id, file_name):
+                        recovered.append({"user_id": user_id, "file_name": file_name, "status": "recovering"})
                 except Exception as e:
                     logger.error(f"❌ Error recovering script: {e}")
             return recovered
@@ -526,7 +570,8 @@ class AutoRecoverySystem:
                     data = json.load(f)
                 return len(data.get("running_scripts", []))
             return 0
-        except:
+        except Exception as e:
+            logger.error(f"❌ Error counting running scripts: {e}")
             return 0
 
 
@@ -808,14 +853,8 @@ def extract_and_setup_zip(zip_path, user_folder, zip_name):
             req_path = os.path.join(extract_dir, 'requirements.txt')
 
         if os.path.exists(req_path):
-            try:
-                subprocess.run(
-                    ['uv', 'pip', 'install', '-r', req_path, '--python', sys.executable, '--quiet'],
-                    capture_output=True, text=True, check=False, timeout=120
-                )
-                logger.info(f"✅ Installed requirements.txt for {zip_name}")
-            except Exception as e:
-                logger.warning(f"⚠️ requirements.txt install error: {e}")
+            if not _install_requirements_file(req_path):
+                logger.warning(f"⚠️ Could not install requirements.txt for {zip_name}")
 
         # Auto-detect and install imports from main.py
         try:
@@ -862,6 +901,7 @@ TELEGRAM_MODULES = {
     'curl_cffi': 'curl_cffi',
     'httpx': 'httpx',
     'httpcore': 'httpcore',
+    'ijson': 'ijson',
     'tgcrypto': 'TgCrypto',
     'nacl': 'PyNaCl',
     'magic_filter': 'magic-filter',
@@ -911,21 +951,59 @@ TELEGRAM_MODULES = {
 }
 
 def _uv_install(package_name):
-    """Install a package using uv (works in Nix environment)."""
-    try:
-        result = subprocess.run(
-            ['uv', 'pip', 'install', package_name, '--python', sys.executable, '--quiet'],
-            capture_output=True, text=True, check=False, timeout=120
-        )
-        if result.returncode == 0:
-            logger.info(f"✅ Installed: {package_name}")
-            return True
-        else:
-            logger.warning(f"⚠️ uv install failed for {package_name}: {result.stderr[:200]}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ uv install error for {package_name}: {e}")
-        return False
+    """Install a package into this bot's Python environment, trying uv then pip."""
+    commands = [
+        ['uv', 'pip', 'install', package_name, '--python', sys.executable, '--quiet'],
+        [sys.executable, '-m', 'pip', 'install', package_name, '--quiet']
+    ]
+    errors = []
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=180
+            )
+            if result.returncode == 0:
+                logger.info(f"✅ Installed: {package_name}")
+                return True
+            errors.append((command[0], result.stderr.strip() or result.stdout.strip()))
+        except (OSError, subprocess.SubprocessError) as e:
+            errors.append((command[0], str(e)))
+    for installer, error in errors:
+        logger.warning(f"⚠️ {installer} could not install {package_name}: {error[:300]}")
+    return False
+
+def _install_requirements_file(requirements_path):
+    """Install a requirements file using uv, with pip as a fallback."""
+    commands = [
+        ['uv', 'pip', 'install', '-r', requirements_path, '--python', sys.executable, '--quiet'],
+        [sys.executable, '-m', 'pip', 'install', '-r', requirements_path, '--quiet']
+    ]
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=300
+            )
+            if result.returncode == 0:
+                logger.info(f"✅ Installed requirements from {requirements_path}")
+                return True
+            logger.warning(
+                f"⚠️ {command[0]} failed for {requirements_path}: "
+                f"{(result.stderr.strip() or result.stdout.strip())[:500]}"
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning(f"⚠️ Could not run {command[0]} for {requirements_path}: {e}")
+    return False
+
+def _python_import_names(file_path):
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as source_file:
+        tree = ast.parse(source_file.read(), filename=file_path)
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split('.')[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split('.')[0])
+    return imports
 
 def sanitize_python_imports(file_path):
     """
@@ -1007,11 +1085,7 @@ def sanitize_python_imports(file_path):
 
 def auto_generate_requirements(file_path, user_folder):
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        imports = set(re.findall(r'^\s*import\s+([a-zA-Z0-9_\.]+)', content, re.MULTILINE))
-        imports |= set(re.findall(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', content, re.MULTILINE))
-        top_level = sorted(set(i.split('.')[0] for i in imports))
+        top_level = sorted(_python_import_names(file_path))
         stdlib = set(getattr(sys, 'stdlib_module_names', []))
         requirements = []
         seen = set()
@@ -1035,13 +1109,10 @@ def auto_generate_requirements(file_path, user_folder):
         return []
 
 def auto_setup_user_env_from_path(file_path, run_dir):
-    """Detect and install missing imports from a specific python file using uv."""
+    """Detect and install missing imports from a Python file."""
+    failures = []
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        imports = set(re.findall(r'^\s*import\s+([a-zA-Z0-9_\.]+)', content, re.MULTILINE))
-        imports |= set(re.findall(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', content, re.MULTILINE))
-        top_level = sorted(set(i.split('.')[0] for i in imports))
+        top_level = sorted(_python_import_names(file_path))
         stdlib = set(getattr(sys, 'stdlib_module_names', []))
         for mod in top_level:
             if mod in stdlib:
@@ -1050,10 +1121,41 @@ def auto_setup_user_env_from_path(file_path, run_dir):
                 __import__(mod)
             except ImportError:
                 pip_name = TELEGRAM_MODULES.get(mod.lower(), mod)
-                if pip_name:
-                    _uv_install(pip_name)
+                if not pip_name or not _uv_install(pip_name):
+                    failures.append(pip_name or mod)
+                    continue
+                try:
+                    __import__(mod)
+                except ImportError:
+                    failures.append(f"{pip_name} (import {mod} still unavailable)")
+        if failures:
+            logger.warning(f"Could not resolve imports in {file_path}: {', '.join(failures)}")
     except Exception as e:
         logger.error(f"❌ Error in auto setup: {e}")
+        failures.append(str(e))
+    return failures
+
+def _prepare_script_environment(file_path, run_dir, user_id, file_name):
+    failures = []
+    if file_name.lower().endswith('.zip'):
+        zip_dir = os.path.join(get_user_folder(user_id), os.path.splitext(file_name)[0])
+        requirements_path = os.path.join(run_dir, 'requirements.txt')
+        if not os.path.isfile(requirements_path):
+            requirements_path = os.path.join(zip_dir, 'requirements.txt')
+        if os.path.isfile(requirements_path) and not _install_requirements_file(requirements_path):
+            failures.append(f"requirements.txt in {os.path.dirname(requirements_path)}")
+    failures.extend(auto_setup_user_env_from_path(file_path, run_dir))
+    if failures:
+        try:
+            bot.send_message(
+                user_id,
+                "⚠️ Could not install some dependencies for "
+                f"{file_name}: {', '.join(sorted(set(failures)))}\n"
+                "The script will still start; check its logs if imports fail."
+            )
+        except Exception as e:
+            logger.warning(f"Could not send dependency warning to {user_id}: {e}")
+    return not failures
 
 def auto_setup_user_env(user_id, file_name):
     """Scan uploaded file for imports and install missing packages using uv."""
@@ -1535,6 +1637,7 @@ def _stop_script(message, user_id, file_name):
     if not is_bot_running(user_id, file_name):
         bot.reply_to(message, B(f"⚠️ `{file_name}` 𝐢𝐬 𝐧𝐨𝐭 𝐫𝐮𝐧𝐧𝐢𝐧𝐠."), parse_mode='Markdown')
         return
+    set_auto_start(user_id, file_name, False)
     msg = bot.reply_to(message, B(f"🛑 𝐒𝐭𝐨𝐩𝐩𝐢𝐧𝐠 `{file_name}`..."))
     try:
         AnimationManager.animate_stop(message.chat.id, msg.message_id)
@@ -1555,6 +1658,8 @@ def _stop_script(message, user_id, file_name):
 
 def _restart_script(message, user_id, file_name):
     script_key = f"{user_id}_{file_name}"
+    if (user_id, file_name) in auto_start_scripts:
+        auto_start_last_attempt[(user_id, file_name)] = time.monotonic()
     if is_bot_running(user_id, file_name):
         if script_key in bot_scripts:
             kill_process_tree(bot_scripts[script_key])
@@ -1581,6 +1686,7 @@ def _delete_script(message, user_id, file_name):
         AnimationManager.animate_delete(message.chat.id, msg.message_id)
     except Exception:
         pass
+    set_auto_start(user_id, file_name, False)
     if is_bot_running(user_id, file_name):
         script_key = f"{user_id}_{file_name}"
         if script_key in bot_scripts:
@@ -1660,11 +1766,29 @@ def _show_logs(message, user_id, file_name):
 def _start_script_silent(user_id, file_name):
     file_path, run_dir, file_type = _get_run_params(user_id, file_name)
     if not file_path or not os.path.exists(file_path):
-        return
+        return False
+    script_key = f"{user_id}_{file_name}"
+    with script_start_lock:
+        if script_key in script_starting or is_bot_running(user_id, file_name):
+            return False
+        script_starting.add(script_key)
     if file_type in ('py', 'zip'):
-        threading.Thread(target=run_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
+        runner = run_script_silent
     elif file_type == 'js':
-        threading.Thread(target=run_js_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
+        runner = run_js_script_silent
+    else:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        return False
+    try:
+        threading.Thread(
+            target=runner, args=(file_path, user_id, run_dir, file_name), daemon=True
+        ).start()
+        return True
+    except Exception:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        raise
 
 def _stop_script_silent(user_id, file_name):
     script_key = f"{user_id}_{file_name}"
@@ -1674,7 +1798,28 @@ def _stop_script_silent(user_id, file_name):
             del bot_scripts[script_key]
     recovery_system.remove_running_script(user_id, file_name)
 
+def monitor_auto_start_scripts():
+    while True:
+        with auto_start_lock:
+            scripts = list(auto_start_scripts)
+        for user_id, file_name in scripts:
+            key = (user_id, file_name)
+            now = time.monotonic()
+            if now - auto_start_last_attempt.get(key, 0) < 30:
+                continue
+            if not any(fname == file_name for fname, _ in user_files.get(user_id, [])):
+                continue
+            if not is_bot_running(user_id, file_name):
+                auto_start_last_attempt[key] = now
+                try:
+                    if not _start_script_silent(user_id, file_name):
+                        logger.warning(f"Auto-start could not start {file_name} for {user_id}")
+                except Exception:
+                    logger.exception(f"Auto-start failed for {file_name} owned by {user_id}")
+        time.sleep(10)
+
 def _delete_script_silent(user_id, file_name):
+    set_auto_start(user_id, file_name, False)
     _stop_script_silent(user_id, file_name)
     user_folder = get_user_folder(user_id)
     file_path = os.path.join(user_folder, file_name)
@@ -1698,50 +1843,75 @@ def _delete_script_silent(user_id, file_name):
 def run_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
+    log_file = None
+    log_thread = None
+    process = None
     try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   encoding='utf-8', errors='ignore')
+        _prepare_script_environment(file_path, run_dir, user_id, file_name)
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            _build_py_cmd(file_path), run_dir, log_file_path
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
                                    'script_key': script_key}
+        with script_start_lock:
+            script_starting.discard(script_key)
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
-    except:
-        pass
+    except Exception:
+        logger.exception(f"Silent Python script failed to start: {file_name}")
     finally:
-        recovery_system.remove_running_script(user_id, file_name)
-        if script_key in bot_scripts:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        current = bot_scripts.get(script_key)
+        if current is not None and current.get('process') is process:
+            recovery_system.remove_running_script(user_id, file_name)
             del bot_scripts[script_key]
+        elif process is None and current is None:
+            recovery_system.remove_running_script(user_id, file_name)
         try:
-            log_file.close()
-        except:
-            pass
+            if log_thread:
+                log_thread.join(timeout=5)
+            if log_file:
+                log_file.close()
+        except OSError:
+            logger.exception(f"Could not close log for {file_name}")
 
 def run_js_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
+    log_file = None
+    log_thread = None
+    process = None
     try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(['node', file_path], cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            ['node', file_path], run_dir, log_file_path
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
                                    'script_key': script_key}
+        with script_start_lock:
+            script_starting.discard(script_key)
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
-    except:
-        pass
+    except Exception:
+        logger.exception(f"Silent JavaScript script failed to start: {file_name}")
     finally:
-        recovery_system.remove_running_script(user_id, file_name)
-        if script_key in bot_scripts:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        current = bot_scripts.get(script_key)
+        if current is not None and current.get('process') is process:
+            recovery_system.remove_running_script(user_id, file_name)
             del bot_scripts[script_key]
+        elif process is None and current is None:
+            recovery_system.remove_running_script(user_id, file_name)
         try:
-            log_file.close()
-        except:
-            pass
+            if log_thread:
+                log_thread.join(timeout=5)
+            if log_file:
+                log_file.close()
+        except OSError:
+            logger.exception(f"Could not close log for {file_name}")
 
 
 # ================================
@@ -1763,31 +1933,68 @@ def _build_py_cmd(file_path):
     )
     return [sys.executable, '-c', bootstrap]
 
+def _start_process_with_bounded_log(command, run_dir, log_file_path, startupinfo=None):
+    log_file = open(log_file_path, 'r+b') if os.path.exists(log_file_path) else open(log_file_path, 'w+b')
+    log_file.seek(0, os.SEEK_END)
+    if log_file.tell() > MAX_SCRIPT_LOG_BYTES:
+        log_file.seek(-(MAX_SCRIPT_LOG_BYTES // 2), os.SEEK_END)
+        retained = log_file.read()
+        log_file.seek(0)
+        log_file.write(retained)
+        log_file.truncate()
+        log_file.seek(0, os.SEEK_END)
+    try:
+        process = subprocess.Popen(
+            command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE, startupinfo=startupinfo, bufsize=0
+        )
+    except Exception:
+        log_file.close()
+        raise
+
+    def drain_output():
+        try:
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    break
+                log_file.write(chunk)
+                if log_file.tell() > MAX_SCRIPT_LOG_BYTES:
+                    log_file.seek(-(MAX_SCRIPT_LOG_BYTES // 2), os.SEEK_END)
+                    retained = log_file.read()
+                    log_file.seek(0)
+                    log_file.write(retained)
+                    log_file.truncate()
+                    log_file.seek(0, os.SEEK_END)
+        except (OSError, ValueError):
+            logger.exception(f"Could not write bounded script log: {log_file_path}")
+        finally:
+            process.stdout.close()
+
+    log_thread = threading.Thread(target=drain_output, daemon=True)
+    log_thread.start()
+    return process, log_file, log_thread
+
 def run_script(file_path, user_id, run_dir, file_name, message):
     script_key = f"{user_id}_{file_name}"
     if script_key in bot_scripts:
         return
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
-    try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-    except Exception as e:
-        try:
-            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫 𝐨𝐩𝐞𝐧𝐢𝐧𝐠 𝐥𝐨𝐠 𝐟𝐢𝐥𝐞: {str(e)}"))
-        except Exception:
-            pass
-        return
+    log_file = None
+    log_thread = None
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   startupinfo=startupinfo, encoding='utf-8', errors='ignore')
+        _prepare_script_environment(file_path, run_dir, user_id, file_name)
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            _build_py_cmd(file_path), run_dir, log_file_path, startupinfo
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
-                                   'script_key': script_key}
+                                   'script_key': script_key, 'log_thread': log_thread}
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
@@ -1798,6 +2005,7 @@ def run_script(file_path, user_id, run_dir, file_name, message):
             pass
         try:
             process.wait()
+            log_thread.join(timeout=5)
             exit_code = process.returncode
             if exit_code != 0:
                 # Read last lines of log for the error
@@ -1821,11 +2029,15 @@ def run_script(file_path, user_id, run_dir, file_name, message):
         except Exception:
             pass
         finally:
-            recovery_system.remove_running_script(user_id, file_name)
-            if script_key in bot_scripts:
+            current = bot_scripts.get(script_key)
+            if current is not None and current.get('process') is process:
+                recovery_system.remove_running_script(user_id, file_name)
                 del bot_scripts[script_key]
+            elif process is None and current is None:
+                recovery_system.remove_running_script(user_id, file_name)
             try:
-                log_file.close()
+                if log_file:
+                    log_file.close()
             except Exception:
                 pass
     except Exception as e:
@@ -1834,7 +2046,8 @@ def run_script(file_path, user_id, run_dir, file_name, message):
         except Exception:
             pass
         try:
-            log_file.close()
+            if log_file:
+                log_file.close()
         except Exception:
             pass
 
@@ -1843,26 +2056,20 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
     if script_key in bot_scripts:
         return
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
-    try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-    except Exception as e:
-        try:
-            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫: {str(e)}"))
-        except Exception:
-            pass
-        return
+    log_file = None
+    log_thread = None
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen(['node', file_path], cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   startupinfo=startupinfo, encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            ['node', file_path], run_dir, log_file_path, startupinfo
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
-                                   'script_key': script_key}
+                                   'script_key': script_key, 'log_thread': log_thread}
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
@@ -1873,6 +2080,7 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
             pass
         try:
             process.wait()
+            log_thread.join(timeout=5)
             exit_code = process.returncode
             if exit_code != 0:
                 try:
@@ -1886,7 +2094,8 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
             if script_key in bot_scripts:
                 del bot_scripts[script_key]
             try:
-                log_file.close()
+                if log_file:
+                    log_file.close()
             except Exception:
                 pass
     except Exception as e:
@@ -1895,7 +2104,8 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
         except Exception:
             pass
         try:
-            log_file.close()
+            if log_file:
+                log_file.close()
         except Exception:
             pass
 
@@ -1921,6 +2131,11 @@ def create_manage_scripts_keyboard(user_id):
             row.append(types.InlineKeyboardButton("▶ Start", callback_data=f"start_script_{fname}"))
         row.append(types.InlineKeyboardButton("🗑 Delete", callback_data=f"delete_script_{fname}"))
         markup.add(*row)
+        auto_start_enabled = (user_id, fname) in auto_start_scripts
+        auto_start_label = "🔁 Auto Start: ON" if auto_start_enabled else "🔁 Auto Start: OFF"
+        markup.add(types.InlineKeyboardButton(
+            auto_start_label, callback_data=f"toggle_autostart_{fname}"
+        ))
         markup.add(types.InlineKeyboardButton("📜 View Logs", callback_data=f"logs_script_{fname}"))
         markup.add(types.InlineKeyboardButton("━━━━━━━━━━━━━━", callback_data="none"))
     markup.add(types.InlineKeyboardButton("🔄 Refresh List", callback_data="manage_scripts"))
@@ -1982,13 +2197,30 @@ def callback_router(call):
                 bot.answer_callback_query(call.id, "⚠️ Already Stopped", show_alert=True)
             else:
                 bot.answer_callback_query(call.id, "🛑 Stopping...")
+                if (user_id, file_name) in auto_start_scripts:
+                    set_auto_start(user_id, file_name, False)
                 _stop_script_silent(user_id, file_name)
                 time.sleep(1)
+                update_manage_scripts_message(call, user_id)
+
+        elif data.startswith('toggle_autostart_'):
+            file_name = data.replace('toggle_autostart_', '', 1)
+            enabled = (user_id, file_name) not in auto_start_scripts
+            if not set_auto_start(user_id, file_name, enabled):
+                bot.answer_callback_query(call.id, "❌ Could not save auto-start setting.", show_alert=True)
+            elif enabled:
+                bot.answer_callback_query(call.id, "🔁 Auto-start enabled; starting file...")
+                _start_script_silent(user_id, file_name)
+                update_manage_scripts_message(call, user_id)
+            else:
+                bot.answer_callback_query(call.id, "⏸ Auto-start disabled.")
                 update_manage_scripts_message(call, user_id)
 
         elif data.startswith('restart_script_'):
             file_name = data.replace('restart_script_', '')
             bot.answer_callback_query(call.id, "🔄 Restarting...")
+            if (user_id, file_name) in auto_start_scripts:
+                auto_start_last_attempt[(user_id, file_name)] = time.monotonic()
             _stop_script_silent(user_id, file_name)
             time.sleep(1)
             _start_script_silent(user_id, file_name)
@@ -2283,7 +2515,6 @@ if __name__ == '__main__':
     logger.info("📊 Auto-Recovery: Enabled")
     logger.info("🔒 Access Control: Admin-Only")
     logger.info(f"👑 Owner ID: {OWNER_ID}")
-    logger.info(f"👥 Authorized Users: {len(authorized_users)}")
     logger.info(f"📁 Total Files: {sum(len(files) for files in user_files.values())}")
     try:
         bot_username = bot.get_me().username
@@ -2298,6 +2529,7 @@ if __name__ == '__main__':
     # Run startup recovery (only if OWNER_ID is set)
     if OWNER_ID != 0:
         threading.Thread(target=startup_recovery).start()
+        threading.Thread(target=monitor_auto_start_scripts, daemon=True).start()
     else:
         logger.warning("⚠️ OWNER_ID not set — skipping startup recovery notification.")
 
@@ -2384,6 +2616,8 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'hosting_uploads')
 HOSTING_DATA_DIR = os.path.join(BASE_DIR, 'hosting_data')
 RUNNING_SCRIPTS_DB = os.path.join(HOSTING_DATA_DIR, 'running_scripts.json')
+AUTO_START_DB = os.path.join(HOSTING_DATA_DIR, 'auto_start_scripts.json')
+MAX_SCRIPT_LOG_BYTES = 512 * 1024
 
 # 𝐓𝐈𝐄𝐑 𝐒𝐘𝐒𝐓𝐄𝐌
 TIER_SYSTEM = {
@@ -2418,12 +2652,17 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+auto_start_scripts = load_auto_start_scripts()
+script_starting = set()
+script_start_lock = threading.Lock()
+auto_start_last_attempt = {}
+
 
 # ================================
 # 𝐀𝐂𝐂𝐄𝐒𝐒 𝐂𝐎𝐍𝐓𝐑𝐎𝐋 𝐌𝐈𝐃𝐃𝐋𝐄𝐖𝐀𝐑𝐄
 # ================================
 class AdminOnlyMiddleware(BaseMiddleware):
-    """Only owner + explicitly authorized users can use this bot."""
+    """Only the configured owner can use this bot."""
     def __init__(self):
         super().__init__()
         self.update_types = ['message', 'callback_query']
@@ -2436,17 +2675,13 @@ class AdminOnlyMiddleware(BaseMiddleware):
         # Allow owner always
         if uid == OWNER_ID:
             return None
-        # Allow explicitly authorized users
-        if uid in authorized_users:
-            return None
-        # Block everyone else
         try:
-            if hasattr(update, 'message') or hasattr(update, 'text') or hasattr(update, 'document'):
-                bot.reply_to(update, "🔒 *Access Denied*\n\nThis bot is private. Contact the admin to get access.", parse_mode='Markdown')
+            if hasattr(update, 'data'):
+                bot.answer_callback_query(update.id, "🔒 Owner only.", show_alert=True)
             else:
-                bot.answer_callback_query(update.id, "🔒 Access Denied. Contact admin.", show_alert=True)
-        except Exception:
-            pass
+                bot.reply_to(update, "🔒 *Access Denied*\n\nThis bot is private. Contact the admin to get access.", parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"Could not notify unauthorized user {uid}: {e}")
         return CancelUpdate()
 
     def post_process(self, update, data, exception=None):
@@ -2712,7 +2947,7 @@ class AutoRecoverySystem:
                 "run_dir": run_dir or os.path.dirname(file_path)
             })
             with open(self.running_scripts_file, 'w') as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, separators=(',', ':'))
         except Exception as e:
             logger.error(f"❌ Error saving running script: {e}")
 
@@ -2724,44 +2959,32 @@ class AutoRecoverySystem:
                 data["running_scripts"] = [s for s in data["running_scripts"]
                                            if not (s["user_id"] == user_id and s["file_name"] == file_name)]
                 with open(self.running_scripts_file, 'w') as f:
-                    json.dump(data, f, indent=4)
+                    json.dump(data, f, separators=(',', ':'))
         except Exception as e:
             logger.error(f"❌ Error removing running script: {e}")
 
     def recover_all_scripts(self):
         try:
-            if not os.path.exists(self.running_scripts_file):
-                return []
-            with open(self.running_scripts_file, 'r') as f:
-                data = json.load(f)
+            data = {"running_scripts": []}
+            if os.path.exists(self.running_scripts_file):
+                with open(self.running_scripts_file, 'r') as f:
+                    data = json.load(f)
+            scripts = {
+                (int(script["user_id"]), script["file_name"])
+                for script in data.get("running_scripts", [])
+            }
+            scripts.update(auto_start_scripts)
             recovered = []
-            for script in data.get("running_scripts", []):
+            for user_id, file_name in scripts:
                 try:
-                    user_id = script["user_id"]
-                    file_name = script["file_name"]
-                    file_path = script["file_path"]
-                    run_dir = script.get("run_dir", os.path.dirname(file_path))
-                    if not os.path.exists(file_path):
-                        continue
                     user_has_file = any(fname == file_name for fname, _ in user_files.get(user_id, []))
                     if not user_has_file:
                         continue
                     tier = get_user_tier(user_id)
                     if not TIER_SYSTEM[tier]['auto_restart']:
                         continue
-                    file_ext = os.path.splitext(file_name)[1].lower()
-                    if file_ext == '.py':
-                        threading.Thread(target=self._restart_py_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    elif file_ext == '.js':
-                        threading.Thread(target=self._restart_js_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    elif file_ext == '.zip':
-                        # For zip, file_path points to main.py inside extracted folder
-                        threading.Thread(target=self._restart_py_script,
-                                         args=(user_id, file_path, run_dir, file_name)).start()
-                    recovered.append({"user_id": user_id, "file_name": file_name, "status": "recovering"})
-                    time.sleep(1)
+                    if _start_script_silent(user_id, file_name):
+                        recovered.append({"user_id": user_id, "file_name": file_name, "status": "recovering"})
                 except Exception as e:
                     logger.error(f"❌ Error recovering script: {e}")
             return recovered
@@ -2810,7 +3033,8 @@ class AutoRecoverySystem:
                     data = json.load(f)
                 return len(data.get("running_scripts", []))
             return 0
-        except:
+        except Exception as e:
+            logger.error(f"❌ Error counting running scripts: {e}")
             return 0
 
 
@@ -3092,14 +3316,8 @@ def extract_and_setup_zip(zip_path, user_folder, zip_name):
             req_path = os.path.join(extract_dir, 'requirements.txt')
 
         if os.path.exists(req_path):
-            try:
-                subprocess.run(
-                    ['uv', 'pip', 'install', '-r', req_path, '--python', sys.executable, '--quiet'],
-                    capture_output=True, text=True, check=False, timeout=120
-                )
-                logger.info(f"✅ Installed requirements.txt for {zip_name}")
-            except Exception as e:
-                logger.warning(f"⚠️ requirements.txt install error: {e}")
+            if not _install_requirements_file(req_path):
+                logger.warning(f"⚠️ Could not install requirements.txt for {zip_name}")
 
         # Auto-detect and install imports from main.py
         try:
@@ -3146,6 +3364,7 @@ TELEGRAM_MODULES = {
     'curl_cffi': 'curl_cffi',
     'httpx': 'httpx',
     'httpcore': 'httpcore',
+    'ijson': 'ijson',
     'tgcrypto': 'TgCrypto',
     'nacl': 'PyNaCl',
     'magic_filter': 'magic-filter',
@@ -3195,21 +3414,26 @@ TELEGRAM_MODULES = {
 }
 
 def _uv_install(package_name):
-    """Install a package using uv (works in Nix environment)."""
-    try:
-        result = subprocess.run(
-            ['uv', 'pip', 'install', package_name, '--python', sys.executable, '--quiet'],
-            capture_output=True, text=True, check=False, timeout=120
-        )
-        if result.returncode == 0:
-            logger.info(f"✅ Installed: {package_name}")
-            return True
-        else:
-            logger.warning(f"⚠️ uv install failed for {package_name}: {result.stderr[:200]}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ uv install error for {package_name}: {e}")
-        return False
+    """Install a package into this bot's Python environment, trying uv then pip."""
+    commands = [
+        ['uv', 'pip', 'install', package_name, '--python', sys.executable, '--quiet'],
+        [sys.executable, '-m', 'pip', 'install', package_name, '--quiet']
+    ]
+    errors = []
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=180
+            )
+            if result.returncode == 0:
+                logger.info(f"✅ Installed: {package_name}")
+                return True
+            errors.append((command[0], result.stderr.strip() or result.stdout.strip()))
+        except (OSError, subprocess.SubprocessError) as e:
+            errors.append((command[0], str(e)))
+    for installer, error in errors:
+        logger.warning(f"⚠️ {installer} could not install {package_name}: {error[:300]}")
+    return False
 
 def sanitize_python_imports(file_path):
     """
@@ -3291,11 +3515,7 @@ def sanitize_python_imports(file_path):
 
 def auto_generate_requirements(file_path, user_folder):
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        imports = set(re.findall(r'^\s*import\s+([a-zA-Z0-9_\.]+)', content, re.MULTILINE))
-        imports |= set(re.findall(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', content, re.MULTILINE))
-        top_level = sorted(set(i.split('.')[0] for i in imports))
+        top_level = sorted(_python_import_names(file_path))
         stdlib = set(getattr(sys, 'stdlib_module_names', []))
         requirements = []
         seen = set()
@@ -3319,13 +3539,10 @@ def auto_generate_requirements(file_path, user_folder):
         return []
 
 def auto_setup_user_env_from_path(file_path, run_dir):
-    """Detect and install missing imports from a specific python file using uv."""
+    """Detect and install missing imports from a Python file."""
+    failures = []
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        imports = set(re.findall(r'^\s*import\s+([a-zA-Z0-9_\.]+)', content, re.MULTILINE))
-        imports |= set(re.findall(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', content, re.MULTILINE))
-        top_level = sorted(set(i.split('.')[0] for i in imports))
+        top_level = sorted(_python_import_names(file_path))
         stdlib = set(getattr(sys, 'stdlib_module_names', []))
         for mod in top_level:
             if mod in stdlib:
@@ -3334,10 +3551,41 @@ def auto_setup_user_env_from_path(file_path, run_dir):
                 __import__(mod)
             except ImportError:
                 pip_name = TELEGRAM_MODULES.get(mod.lower(), mod)
-                if pip_name:
-                    _uv_install(pip_name)
+                if not pip_name or not _uv_install(pip_name):
+                    failures.append(pip_name or mod)
+                    continue
+                try:
+                    __import__(mod)
+                except ImportError:
+                    failures.append(f"{pip_name} (import {mod} still unavailable)")
+        if failures:
+            logger.warning(f"Could not resolve imports in {file_path}: {', '.join(failures)}")
     except Exception as e:
         logger.error(f"❌ Error in auto setup: {e}")
+        failures.append(str(e))
+    return failures
+
+def _prepare_script_environment(file_path, run_dir, user_id, file_name):
+    failures = []
+    if file_name.lower().endswith('.zip'):
+        zip_dir = os.path.join(get_user_folder(user_id), os.path.splitext(file_name)[0])
+        requirements_path = os.path.join(run_dir, 'requirements.txt')
+        if not os.path.isfile(requirements_path):
+            requirements_path = os.path.join(zip_dir, 'requirements.txt')
+        if os.path.isfile(requirements_path) and not _install_requirements_file(requirements_path):
+            failures.append(f"requirements.txt in {os.path.dirname(requirements_path)}")
+    failures.extend(auto_setup_user_env_from_path(file_path, run_dir))
+    if failures:
+        try:
+            bot.send_message(
+                user_id,
+                "⚠️ Could not install some dependencies for "
+                f"{file_name}: {', '.join(sorted(set(failures)))}\n"
+                "The script will still start; check its logs if imports fail."
+            )
+        except Exception as e:
+            logger.warning(f"Could not send dependency warning to {user_id}: {e}")
+    return not failures
 
 def auto_setup_user_env(user_id, file_name):
     """Scan uploaded file for imports and install missing packages using uv."""
@@ -3819,6 +4067,7 @@ def _stop_script(message, user_id, file_name):
     if not is_bot_running(user_id, file_name):
         bot.reply_to(message, B(f"⚠️ `{file_name}` 𝐢𝐬 𝐧𝐨𝐭 𝐫𝐮𝐧𝐧𝐢𝐧𝐠."), parse_mode='Markdown')
         return
+    set_auto_start(user_id, file_name, False)
     msg = bot.reply_to(message, B(f"🛑 𝐒𝐭𝐨𝐩𝐩𝐢𝐧𝐠 `{file_name}`..."))
     try:
         AnimationManager.animate_stop(message.chat.id, msg.message_id)
@@ -3839,6 +4088,8 @@ def _stop_script(message, user_id, file_name):
 
 def _restart_script(message, user_id, file_name):
     script_key = f"{user_id}_{file_name}"
+    if (user_id, file_name) in auto_start_scripts:
+        auto_start_last_attempt[(user_id, file_name)] = time.monotonic()
     if is_bot_running(user_id, file_name):
         if script_key in bot_scripts:
             kill_process_tree(bot_scripts[script_key])
@@ -3865,6 +4116,7 @@ def _delete_script(message, user_id, file_name):
         AnimationManager.animate_delete(message.chat.id, msg.message_id)
     except Exception:
         pass
+    set_auto_start(user_id, file_name, False)
     if is_bot_running(user_id, file_name):
         script_key = f"{user_id}_{file_name}"
         if script_key in bot_scripts:
@@ -3944,11 +4196,29 @@ def _show_logs(message, user_id, file_name):
 def _start_script_silent(user_id, file_name):
     file_path, run_dir, file_type = _get_run_params(user_id, file_name)
     if not file_path or not os.path.exists(file_path):
-        return
+        return False
+    script_key = f"{user_id}_{file_name}"
+    with script_start_lock:
+        if script_key in script_starting or is_bot_running(user_id, file_name):
+            return False
+        script_starting.add(script_key)
     if file_type in ('py', 'zip'):
-        threading.Thread(target=run_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
+        runner = run_script_silent
     elif file_type == 'js':
-        threading.Thread(target=run_js_script_silent, args=(file_path, user_id, run_dir, file_name)).start()
+        runner = run_js_script_silent
+    else:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        return False
+    try:
+        threading.Thread(
+            target=runner, args=(file_path, user_id, run_dir, file_name), daemon=True
+        ).start()
+        return True
+    except Exception:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        raise
 
 def _stop_script_silent(user_id, file_name):
     script_key = f"{user_id}_{file_name}"
@@ -3958,7 +4228,28 @@ def _stop_script_silent(user_id, file_name):
             del bot_scripts[script_key]
     recovery_system.remove_running_script(user_id, file_name)
 
+def monitor_auto_start_scripts():
+    while True:
+        with auto_start_lock:
+            scripts = list(auto_start_scripts)
+        for user_id, file_name in scripts:
+            key = (user_id, file_name)
+            now = time.monotonic()
+            if now - auto_start_last_attempt.get(key, 0) < 30:
+                continue
+            if not any(fname == file_name for fname, _ in user_files.get(user_id, [])):
+                continue
+            if not is_bot_running(user_id, file_name):
+                auto_start_last_attempt[key] = now
+                try:
+                    if not _start_script_silent(user_id, file_name):
+                        logger.warning(f"Auto-start could not start {file_name} for {user_id}")
+                except Exception:
+                    logger.exception(f"Auto-start failed for {file_name} owned by {user_id}")
+        time.sleep(10)
+
 def _delete_script_silent(user_id, file_name):
+    set_auto_start(user_id, file_name, False)
     _stop_script_silent(user_id, file_name)
     user_folder = get_user_folder(user_id)
     file_path = os.path.join(user_folder, file_name)
@@ -3982,50 +4273,71 @@ def _delete_script_silent(user_id, file_name):
 def run_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
+    log_file = None
+    log_thread = None
+    process = None
     try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            _build_py_cmd(file_path), run_dir, log_file_path
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
                                    'script_key': script_key}
+        with script_start_lock:
+            script_starting.discard(script_key)
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
-    except:
-        pass
+    except Exception:
+        logger.exception(f"Silent Python script failed to start: {file_name}")
     finally:
+        with script_start_lock:
+            script_starting.discard(script_key)
         recovery_system.remove_running_script(user_id, file_name)
         if script_key in bot_scripts:
             del bot_scripts[script_key]
         try:
-            log_file.close()
-        except:
-            pass
+            if log_thread:
+                log_thread.join(timeout=5)
+            if log_file:
+                log_file.close()
+        except OSError:
+            logger.exception(f"Could not close log for {file_name}")
 
 def run_js_script_silent(file_path, user_id, run_dir, file_name):
     script_key = f"{user_id}_{file_name}"
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
+    log_file = None
+    log_thread = None
+    process = None
     try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-        process = subprocess.Popen(['node', file_path], cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            ['node', file_path], run_dir, log_file_path
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
                                    'script_key': script_key}
+        with script_start_lock:
+            script_starting.discard(script_key)
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         process.wait()
-    except:
-        pass
+    except Exception:
+        logger.exception(f"Silent JavaScript script failed to start: {file_name}")
     finally:
-        recovery_system.remove_running_script(user_id, file_name)
-        if script_key in bot_scripts:
+        with script_start_lock:
+            script_starting.discard(script_key)
+        current = bot_scripts.get(script_key)
+        if current is not None and current.get('process') is process:
+            recovery_system.remove_running_script(user_id, file_name)
             del bot_scripts[script_key]
+        elif process is None and current is None:
+            recovery_system.remove_running_script(user_id, file_name)
         try:
-            log_file.close()
-        except:
-            pass
+            if log_thread:
+                log_thread.join(timeout=5)
+            if log_file:
+                log_file.close()
+        except OSError:
+            logger.exception(f"Could not close log for {file_name}")
 
 
 # ================================
@@ -4047,31 +4359,67 @@ def _build_py_cmd(file_path):
     )
     return [sys.executable, '-c', bootstrap]
 
+def _start_process_with_bounded_log(command, run_dir, log_file_path, startupinfo=None):
+    log_file = open(log_file_path, 'r+b') if os.path.exists(log_file_path) else open(log_file_path, 'w+b')
+    log_file.seek(0, os.SEEK_END)
+    if log_file.tell() > MAX_SCRIPT_LOG_BYTES:
+        log_file.seek(-(MAX_SCRIPT_LOG_BYTES // 2), os.SEEK_END)
+        retained = log_file.read()
+        log_file.seek(0)
+        log_file.write(retained)
+        log_file.truncate()
+        log_file.seek(0, os.SEEK_END)
+    try:
+        process = subprocess.Popen(
+            command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE, startupinfo=startupinfo, bufsize=0
+        )
+    except Exception:
+        log_file.close()
+        raise
+
+    def drain_output():
+        try:
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    break
+                log_file.write(chunk)
+                if log_file.tell() > MAX_SCRIPT_LOG_BYTES:
+                    log_file.seek(-(MAX_SCRIPT_LOG_BYTES // 2), os.SEEK_END)
+                    retained = log_file.read()
+                    log_file.seek(0)
+                    log_file.write(retained)
+                    log_file.truncate()
+                    log_file.seek(0, os.SEEK_END)
+        except (OSError, ValueError):
+            logger.exception(f"Could not write bounded script log: {log_file_path}")
+        finally:
+            process.stdout.close()
+
+    log_thread = threading.Thread(target=drain_output, daemon=True)
+    log_thread.start()
+    return process, log_file, log_thread
+
 def run_script(file_path, user_id, run_dir, file_name, message):
     script_key = f"{user_id}_{file_name}"
     if script_key in bot_scripts:
         return
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
-    try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-    except Exception as e:
-        try:
-            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫 𝐨𝐩𝐞𝐧𝐢𝐧𝐠 𝐥𝐨𝐠 𝐟𝐢𝐥𝐞: {str(e)}"))
-        except Exception:
-            pass
-        return
+    log_file = None
+    log_thread = None
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen(_build_py_cmd(file_path), cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   startupinfo=startupinfo, encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            _build_py_cmd(file_path), run_dir, log_file_path, startupinfo
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'py',
-                                   'script_key': script_key}
+                                   'script_key': script_key, 'log_thread': log_thread}
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
@@ -4082,6 +4430,7 @@ def run_script(file_path, user_id, run_dir, file_name, message):
             pass
         try:
             process.wait()
+            log_thread.join(timeout=5)
             exit_code = process.returncode
             if exit_code != 0:
                 # Read last lines of log for the error
@@ -4109,7 +4458,8 @@ def run_script(file_path, user_id, run_dir, file_name, message):
             if script_key in bot_scripts:
                 del bot_scripts[script_key]
             try:
-                log_file.close()
+                if log_file:
+                    log_file.close()
             except Exception:
                 pass
     except Exception as e:
@@ -4118,7 +4468,8 @@ def run_script(file_path, user_id, run_dir, file_name, message):
         except Exception:
             pass
         try:
-            log_file.close()
+            if log_file:
+                log_file.close()
         except Exception:
             pass
 
@@ -4127,26 +4478,20 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
     if script_key in bot_scripts:
         return
     log_file_path = os.path.join(get_user_folder(user_id), f"{os.path.splitext(file_name)[0]}.log")
-    try:
-        log_file = open(log_file_path, 'a', encoding='utf-8', errors='ignore')
-    except Exception as e:
-        try:
-            bot.reply_to(message, B(f"❌ 𝐄𝐫𝐫𝐨𝐫: {str(e)}"))
-        except Exception:
-            pass
-        return
+    log_file = None
+    log_thread = None
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
-        process = subprocess.Popen(['node', file_path], cwd=run_dir,
-                                   stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
-                                   startupinfo=startupinfo, encoding='utf-8', errors='ignore')
+        process, log_file, log_thread = _start_process_with_bounded_log(
+            ['node', file_path], run_dir, log_file_path, startupinfo
+        )
         bot_scripts[script_key] = {'process': process, 'log_file': log_file, 'file_name': file_name,
                                    'user_id': user_id, 'start_time': datetime.now(), 'type': 'js',
-                                   'script_key': script_key}
+                                   'script_key': script_key, 'log_thread': log_thread}
         recovery_system.save_running_script(user_id, file_name, file_path, process.pid, run_dir)
         try:
             time.sleep(2)
@@ -4157,6 +4502,7 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
             pass
         try:
             process.wait()
+            log_thread.join(timeout=5)
             exit_code = process.returncode
             if exit_code != 0:
                 try:
@@ -4170,7 +4516,8 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
             if script_key in bot_scripts:
                 del bot_scripts[script_key]
             try:
-                log_file.close()
+                if log_file:
+                    log_file.close()
             except Exception:
                 pass
     except Exception as e:
@@ -4179,7 +4526,8 @@ def run_js_script(file_path, user_id, run_dir, file_name, message):
         except Exception:
             pass
         try:
-            log_file.close()
+            if log_file:
+                log_file.close()
         except Exception:
             pass
 
@@ -4205,6 +4553,11 @@ def create_manage_scripts_keyboard(user_id):
             row.append(types.InlineKeyboardButton("▶ Start", callback_data=f"start_script_{fname}"))
         row.append(types.InlineKeyboardButton("🗑 Delete", callback_data=f"delete_script_{fname}"))
         markup.add(*row)
+        auto_start_enabled = (user_id, fname) in auto_start_scripts
+        auto_start_label = "🔁 Auto Start: ON" if auto_start_enabled else "🔁 Auto Start: OFF"
+        markup.add(types.InlineKeyboardButton(
+            auto_start_label, callback_data=f"toggle_autostart_{fname}"
+        ))
         markup.add(types.InlineKeyboardButton("📜 View Logs", callback_data=f"logs_script_{fname}"))
         markup.add(types.InlineKeyboardButton("━━━━━━━━━━━━━━", callback_data="none"))
     markup.add(types.InlineKeyboardButton("🔄 Refresh List", callback_data="manage_scripts"))
@@ -4266,13 +4619,30 @@ def callback_router(call):
                 bot.answer_callback_query(call.id, "⚠️ Already Stopped", show_alert=True)
             else:
                 bot.answer_callback_query(call.id, "🛑 Stopping...")
+                if (user_id, file_name) in auto_start_scripts:
+                    set_auto_start(user_id, file_name, False)
                 _stop_script_silent(user_id, file_name)
                 time.sleep(1)
+                update_manage_scripts_message(call, user_id)
+
+        elif data.startswith('toggle_autostart_'):
+            file_name = data.replace('toggle_autostart_', '', 1)
+            enabled = (user_id, file_name) not in auto_start_scripts
+            if not set_auto_start(user_id, file_name, enabled):
+                bot.answer_callback_query(call.id, "❌ Could not save auto-start setting.", show_alert=True)
+            elif enabled:
+                bot.answer_callback_query(call.id, "🔁 Auto-start enabled; starting file...")
+                _start_script_silent(user_id, file_name)
+                update_manage_scripts_message(call, user_id)
+            else:
+                bot.answer_callback_query(call.id, "⏸ Auto-start disabled.")
                 update_manage_scripts_message(call, user_id)
 
         elif data.startswith('restart_script_'):
             file_name = data.replace('restart_script_', '')
             bot.answer_callback_query(call.id, "🔄 Restarting...")
+            if (user_id, file_name) in auto_start_scripts:
+                auto_start_last_attempt[(user_id, file_name)] = time.monotonic()
             _stop_script_silent(user_id, file_name)
             time.sleep(1)
             _start_script_silent(user_id, file_name)
@@ -4567,7 +4937,6 @@ if __name__ == '__main__':
     logger.info("📊 Auto-Recovery: Enabled")
     logger.info("🔒 Access Control: Admin-Only")
     logger.info(f"👑 Owner ID: {OWNER_ID}")
-    logger.info(f"👥 Authorized Users: {len(authorized_users)}")
     logger.info(f"📁 Total Files: {sum(len(files) for files in user_files.values())}")
     try:
         bot_username = bot.get_me().username
@@ -4582,6 +4951,7 @@ if __name__ == '__main__':
     # Run startup recovery (only if OWNER_ID is set)
     if OWNER_ID != 0:
         threading.Thread(target=startup_recovery).start()
+        threading.Thread(target=monitor_auto_start_scripts, daemon=True).start()
     else:
         logger.warning("⚠️ OWNER_ID not set — skipping startup recovery notification.")
 
