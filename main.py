@@ -6,8 +6,8 @@
 """
 
 import base64
-import codecs
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 import html
 import json
 import logging
@@ -59,14 +59,11 @@ BACKUP_INTERVAL_SECONDS = 24 * 60 * 60
 API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 FIREBASE_REGEX = re.compile(r"(^|\.)firebaseio\.com$|(^|\.)firebasedatabase\.app$|(^|\.)firebaseapp\.com$", re.I)
 
-MAX_FILE = 100 * 1024 * 1024  # Extended to 100MB File Limit
-MAX_ENTRY = 50 * 1024 * 1024
-MAX_SCAN = 100 * 1024 * 1024
+MAX_FILE = 50 * 1024 * 1024  # Extended to 100MB File Limit
+MAX_ENTRY = 20 * 1024 * 1024
+MAX_SCAN = 40 * 1024 * 1024
 MAX_VIEWER_SCAN = 5 * 1024 * 1024
-MAX_VIEWER_RESPONSE_BYTES = 100 * 1024 * 1024
-MAX_VIEWER_ENTRY_BYTES = 2 * 1024 * 1024
-MAX_VIEWER_TARGETS = min(10000, max(1, env_int("MAX_VIEWER_TARGETS", 10000)))
-MAX_VIEWER_RESULT_SESSIONS = 64
+MAX_VIEWER_TARGETS = max(1, env_int("MAX_VIEWER_TARGETS", 10000))
 MAX_PENDING_APKS_PER_USER = max(1, env_int("MAX_PENDING_APKS_PER_USER", 3))
 MAX_QUEUED_WORK = max(8, env_int("MAX_QUEUED_WORK", 64))
 START_REPLY_DELAY_SECONDS = 0
@@ -97,19 +94,11 @@ fallback_settings = {
 captcha_challenges = {}
 verified_users = set()
 BOT_USERNAME = "your_bot"
-WORKERS = ThreadPoolExecutor(max_workers=16, thread_name_prefix="bot-worker")
+WORKERS = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bot-worker")
 WORK_DISPATCH_SLOTS = threading.BoundedSemaphore(MAX_QUEUED_WORK)
-CALLBACK_WORKERS = ThreadPoolExecutor(max_workers=16, thread_name_prefix="bot-callback")
-CALLBACK_DISPATCH_SLOTS = threading.BoundedSemaphore(64)
-CALLBACK_ACK_WORKERS = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bot-callback-ack")
-CALLBACK_ACK_SLOTS = threading.BoundedSemaphore(64)
-EXTRACTION_SLOTS = threading.BoundedSemaphore(4)
-VIEWER_SLOTS = threading.BoundedSemaphore(6)
+EXTRACTION_SLOTS = threading.BoundedSemaphore(2)
+VIEWER_SLOTS = threading.BoundedSemaphore(4)
 LIMIT_LOCK = threading.Lock()
-MEMBERSHIP_CACHE_LOCK = threading.Lock()
-MEMBERSHIP_CACHE_TTL_SECONDS = 30
-MAX_MEMBERSHIP_CACHE_ENTRIES = 4096
-membership_cache = {}
 active_extraction_users = set()
 active_viewer_users = set()
 user_update_locks = {}
@@ -178,67 +167,6 @@ def submit_user_work(function, payload):
 
     return submit_work(run_serialized)
 
-def submit_callback(query):
-    msg = query.get("message", {})
-    if not CALLBACK_DISPATCH_SLOTS.acquire(blocking=False):
-        submit_callback_ack(query, "Bot is busy. Please try again in a moment.")
-        LOG.warning("Dropping callback because the callback queue is full")
-        return False
-
-    submit_callback_ack(query, "" if is_private_chat(msg) else "Please use the bot in private chat.")
-    submitted_at = time.monotonic()
-
-    def runner():
-        started_at = time.monotonic()
-        try:
-            if is_private_chat(msg):
-                callback(query, callback_answered=True)
-        except Exception:
-            LOG.exception("Callback task failed: %s", query.get("data", ""))
-        finally:
-            elapsed = time.monotonic() - started_at
-            if elapsed >= 2:
-                action = query.get("data", "").split(":", 1)[0]
-                LOG.warning(
-                    "Slow button callback action=%s queue_wait=%.2fs duration=%.2fs",
-                    action,
-                    started_at - submitted_at,
-                    elapsed,
-                )
-            CALLBACK_DISPATCH_SLOTS.release()
-
-    try:
-        CALLBACK_WORKERS.submit(runner)
-    except Exception:
-        CALLBACK_DISPATCH_SLOTS.release()
-        LOG.exception("Could not submit callback task")
-        answer(query, "Bot is busy. Please try again in a moment.")
-        return False
-    return True
-
-def submit_callback_ack(query, text):
-    if not CALLBACK_ACK_SLOTS.acquire(blocking=False):
-        LOG.warning("Could not acknowledge callback because the acknowledgment queue is full")
-        return False
-
-    def runner():
-        started_at = time.monotonic()
-        try:
-            answer(query, text)
-        finally:
-            elapsed = time.monotonic() - started_at
-            if elapsed >= 2:
-                LOG.warning("Slow Telegram callback acknowledgment: %.2fs", elapsed)
-            CALLBACK_ACK_SLOTS.release()
-
-    try:
-        CALLBACK_ACK_WORKERS.submit(runner)
-    except Exception:
-        CALLBACK_ACK_SLOTS.release()
-        LOG.exception("Could not submit callback acknowledgment")
-        return False
-    return True
-
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM API WRAPPERS
 # ═══════════════════════════════════════════════════════════════
@@ -261,8 +189,8 @@ def send_document(chat_id, file_path):
     mime_type = "text/plain" if Path(file_path).suffix.lower() in {".txt", ".text", ".log"} else "application/json"
     content.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{Path(file_path).name}\"\r\nContent-Type: {mime_type}\r\n\r\n".encode() + Path(file_path).read_bytes() + b"\r\n")
     content.append(f"--{boundary}--\r\n".encode())
-    with urlopen(Request(f"{API}/sendDocument", data=b"".join(content), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}), timeout=35) as response:
-        result = json.loads(response.read().decode())
+    response = urlopen(Request(f"{API}/sendDocument", data=b"".join(content), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}), timeout=35)
+    result = json.loads(response.read().decode())
     if not result.get("ok"):
         raise RuntimeError(result.get("description", "Telegram file upload failed"))
     return result.get("result")
@@ -279,12 +207,21 @@ def send_database_backup():
         return
     backup_path = None
     try:
-        backup = {"created_at": now().isoformat(), "database": db.name, "collections": {}}
-        for collection_name in db.list_collection_names():
-            backup["collections"][collection_name] = list(db[collection_name].find({}))
         with tempfile.NamedTemporaryFile(prefix="firebase-backup-", suffix=".json", mode="w", encoding="utf-8", delete=False) as handle:
             backup_path = Path(handle.name)
-            handle.write(bson_dumps(backup, indent=2))
+            handle.write('{\n  "created_at": "' + now().isoformat() + '",\n  "database": "' + str(db.name) + '",\n  "collections": {\n')
+            colls = db.list_collection_names()
+            for ci, collection_name in enumerate(colls):
+                handle.write(f'    "{collection_name}": [\n')
+                cursor = db[collection_name].find({})
+                first = True
+                for doc in cursor:
+                    if not first:
+                        handle.write(',\n')
+                    first = False
+                    handle.write('      ' + bson_dumps(doc))
+                handle.write('\n    ]' + (',' if ci < len(colls) - 1 else '') + '\n')
+            handle.write('  }\n}\n')
         recipients = backup_admin_ids()
         for admin_id in recipients:
             try:
@@ -297,6 +234,7 @@ def send_database_backup():
     finally:
         if backup_path:
             backup_path.unlink(missing_ok=True)
+        gc.collect()
 
 def backup_loop():
     while True:
@@ -356,7 +294,7 @@ def edit(chat, message_id, text, markup=None):
         return send(chat, text, markup)
 
 def answer(query, text=""):
-    try: tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": text[:190]}, timeout=5)
+    try: tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": text[:190]})
     except Exception: pass
 
 # ═══════════════════════════════════════════════════════════════
@@ -517,34 +455,13 @@ def channel_member_status(channel, uid):
         LOG.warning("Membership check failed for %s: %s", channel.get("chat_id"), exc)
         return False
 
-def unjoined_channels(uid, use_cache=False):
-    if use_cache:
-        with MEMBERSHIP_CACHE_LOCK:
-            cached = membership_cache.get(uid)
-            if cached and cached[0] > time.monotonic():
-                return cached[1]
-
+def unjoined_channels(uid):
     channels_to_check = channels_list()
     if not channels_to_check:
-        unjoined = []
-    else:
-        with ThreadPoolExecutor(max_workers=min(8, len(channels_to_check)), thread_name_prefix="membership-check") as pool:
-            joined = list(pool.map(lambda channel: channel_member_status(channel, uid), channels_to_check))
-        unjoined = [channel for channel, is_joined in zip(channels_to_check, joined) if not is_joined]
-
-    with MEMBERSHIP_CACHE_LOCK:
-        if len(membership_cache) >= MAX_MEMBERSHIP_CACHE_ENTRIES:
-            expired = [key for key, (expires_at, _) in membership_cache.items() if expires_at <= time.monotonic()]
-            for key in expired:
-                membership_cache.pop(key, None)
-            if len(membership_cache) >= MAX_MEMBERSHIP_CACHE_ENTRIES:
-                membership_cache.pop(next(iter(membership_cache)))
-        membership_cache[uid] = (time.monotonic() + MEMBERSHIP_CACHE_TTL_SECONDS, unjoined)
-    return unjoined
-
-def clear_membership_cache():
-    with MEMBERSHIP_CACHE_LOCK:
-        membership_cache.clear()
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(channels_to_check)), thread_name_prefix="membership-check") as pool:
+        joined = list(pool.map(lambda channel: channel_member_status(channel, uid), channels_to_check))
+    return [channel for channel, is_joined in zip(channels_to_check, joined) if not is_joined]
 
 def subscribed(uid):
     return not unjoined_channels(uid)
@@ -572,7 +489,7 @@ def require_membership(chat, uid, message_id=None):
     """Return False and show the join screen when a non-admin has left."""
     if is_admin(uid):
         return True
-    unjoined = unjoined_channels(uid, use_cache=True)
+    unjoined = unjoined_channels(uid)
     if not unjoined:
         return True
     cancel_extract_timeout(uid)
@@ -935,7 +852,7 @@ def download(file_id):
                     while chunk := response.read(256 * 1024):
                         size += len(chunk)
                         if size > MAX_FILE:
-                            raise RuntimeError("File size exceeds 100MB limit!")
+                            raise RuntimeError("File size exceeds 50MB limit!")
                         out.write(chunk)
                 return path
             except (TimeoutError, OSError) as exc:
@@ -1099,24 +1016,16 @@ def send_user_history_txt(chat, uid):
     return send_extraction_txt(chat, "My Unique Firebase History", urls)
 
 
-def send_viewer_result_pages(chat, active_results, inactive_results):
+def send_viewer_result_pages(chat, active_results, protected_results, inactive_results):
     """Send grouped viewer results, keeping each Telegram page compact."""
     expiry = time.time() - 3600
     for old_key, old_state in list(viewer_result_pages.items()):
         if old_state.get("created_at", 0) < expiry:
             viewer_result_pages.pop(old_key, None)
-    while len(viewer_result_pages) + sum(bool(items) for items in (active_results, inactive_results)) > MAX_VIEWER_RESULT_SESSIONS:
-        oldest_key = min(
-            viewer_result_pages,
-            key=lambda key: viewer_result_pages[key].get("created_at", 0),
-            default=None,
-        )
-        if oldest_key is None:
-            break
-        viewer_result_pages.pop(oldest_key, None)
     for category, title, records in (
-        ("active", "Active Firebase URLs", active_results),
-        ("inactive", "Unavailable / Failed Firebase URLs", inactive_results),
+        ("active", "🟢 Active Firebase URLs", active_results),
+        ("protected", "⚠️ Protected By Auth Firebase URLs", protected_results),
+        ("inactive", "🔴 Deactivated / Unavailable Firebase URLs", inactive_results),
     ):
         if not records:
             continue
@@ -1147,11 +1056,18 @@ def send_viewer_result_page(chat, page_key, page, message_id=None):
         for index, (target, total, online, offline, unknown) in enumerate(selected, page * page_size + 1):
             lines.append(
                 f"{index}. <code>{esc(target)}</code>\n"
-                f"   📊 Total: <b>{total}</b> | 🟢 <b>{online}</b> | 🔴 <b>{offline}</b> | ⚪ <b>{unknown}</b>"
+                f"   📊 Total: <b>{total}</b> | 🟢 <b>{online}</b> | 🔴 <b>{offline}</b>"
+            )
+    elif state["category"] == "protected":
+        for index, record in enumerate(selected, page * page_size + 1):
+            target = record[0]
+            lines.append(
+                f"{index}. <code>{esc(target)}</code>\n"
+                f"   ⚠️ <b>Protected By Auth</b> (Firebase is active and you can use it only using correct auth/password)"
             )
     else:
         for index, (target, reason) in enumerate(selected, page * page_size + 1):
-            lines.append(f"{index}. <code>{esc(target)}</code>\n   ⚠️ {esc(reason)}")
+            lines.append(f"{index}. <code>{esc(target)}</code>\n   🔴 {esc(reason)}")
     markup = None
     if total_pages > 1:
         controls = []
@@ -1160,7 +1076,8 @@ def send_viewer_result_page(chat, page_key, page, message_id=None):
         if page < total_pages - 1:
             controls.append(btn("Next ➡️", f"viewerpage:{state['category']}:{page_key}:{page + 1}"))
         markup = kb([controls])
-    text = f"{'✅' if state['category'] == 'active' else '❌'} <b>{state['title']}</b> ({page + 1}/{total_pages})\n\n" + "\n".join(lines)
+    prefix_icon = '🟢' if state['category'] == 'active' else ('⚠️' if state['category'] == 'protected' else '🔴')
+    text = f"{prefix_icon} <b>{state['title']}</b> ({page + 1}/{total_pages})\n\n" + "\n".join(lines)
     return edit(chat, message_id, text, markup) if message_id else send(chat, text, markup)
 
 
@@ -1258,150 +1175,6 @@ def firebase_status_summary(data):
             unknown += 1
     return total, online, total - online - unknown, unknown
 
-def firebase_status_summary_stream(response):
-    """Summarize a Firebase object one top-level record at a time."""
-    decoder = json.JSONDecoder()
-    utf8_decoder = codecs.getincrementaldecoder("utf-8")()
-    buffer = ""
-    total_bytes = 0
-    eof = False
-
-    def read_more():
-        nonlocal buffer, total_bytes, eof
-        if eof:
-            return False
-        chunk = response.read(64 * 1024)
-        if not chunk:
-            buffer += utf8_decoder.decode(b"", final=True)
-            eof = True
-            return False
-        total_bytes += len(chunk)
-        if total_bytes > MAX_VIEWER_RESPONSE_BYTES:
-            raise ValueError(
-                f"Firebase response exceeds the {MAX_VIEWER_RESPONSE_BYTES // (1024 * 1024)} MB Viewer limit."
-            )
-        buffer += utf8_decoder.decode(chunk)
-        return True
-
-    def ensure(position):
-        while position >= len(buffer) and read_more():
-            pass
-        return position < len(buffer)
-
-    def skip_whitespace(position):
-        while ensure(position) and buffer[position].isspace():
-            position += 1
-        return position
-
-    def scan_string(position):
-        if not ensure(position) or buffer[position] != '"':
-            raise ValueError("Firebase returned invalid JSON.")
-        cursor = position + 1
-        escaped = False
-        while True:
-            while cursor < len(buffer):
-                char = buffer[cursor]
-                cursor += 1
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    return cursor
-                if cursor - position > MAX_VIEWER_ENTRY_BYTES:
-                    raise ValueError("A Firebase record exceeds the 2 MB Viewer limit.")
-            if not read_more():
-                raise ValueError("Firebase returned incomplete JSON.")
-
-    def scan_value(position):
-        if not ensure(position):
-            raise ValueError("Firebase returned incomplete JSON.")
-        first = buffer[position]
-        if first == '"':
-            return scan_string(position)
-        if first in "[{":
-            cursor = position
-            depth = 0
-            in_string = False
-            escaped = False
-            while True:
-                while cursor < len(buffer):
-                    char = buffer[cursor]
-                    cursor += 1
-                    if in_string:
-                        if escaped:
-                            escaped = False
-                        elif char == "\\":
-                            escaped = True
-                        elif char == '"':
-                            in_string = False
-                    elif char == '"':
-                        in_string = True
-                    elif char in "[{":
-                        depth += 1
-                    elif char in "]}":
-                        depth -= 1
-                        if depth == 0:
-                            return cursor
-                    if cursor - position > MAX_VIEWER_ENTRY_BYTES:
-                        raise ValueError("A Firebase record exceeds the 2 MB Viewer limit.")
-                if not read_more():
-                    raise ValueError("Firebase returned incomplete JSON.")
-
-        cursor = position
-        while ensure(cursor) and buffer[cursor] not in ",}":
-            cursor += 1
-        if cursor == len(buffer) and not eof:
-            read_more()
-            return scan_value(position)
-        return cursor
-
-    position = skip_whitespace(0)
-    if not ensure(position):
-        raise ValueError("Firebase returned an empty response.")
-    if buffer[position] == "n":
-        while len(buffer) < position + 4 and read_more():
-            pass
-        if buffer[position:position + 4] == "null":
-            raise ValueError("Ye Firebase deactivate hai. Please send another Firebase URL.")
-    if buffer[position] != "{":
-        raise ValueError("Firebase response is not a JSON object.")
-    position += 1
-    total = online = offline = unknown = 0
-
-    while True:
-        position = skip_whitespace(position)
-        if not ensure(position):
-            raise ValueError("Firebase returned incomplete JSON.")
-        if buffer[position] == "}":
-            return total, online, offline, unknown
-        if buffer[position] == ",":
-            position = skip_whitespace(position + 1)
-        if not ensure(position) or buffer[position] != '"':
-            raise ValueError("Firebase returned invalid JSON.")
-
-        key_end = scan_string(position)
-        key = json.loads(buffer[position:key_end])
-        position = skip_whitespace(key_end)
-        if not ensure(position) or buffer[position] != ":":
-            raise ValueError("Firebase returned invalid JSON.")
-
-        value_start = skip_whitespace(position + 1)
-        value_end = scan_value(value_start)
-        value_text = buffer[value_start:value_end]
-        if len(value_text.encode("utf-8")) > MAX_VIEWER_ENTRY_BYTES:
-            raise ValueError("A Firebase record exceeds the 2 MB Viewer limit.")
-        value = decoder.raw_decode(value_text)[0]
-        if isinstance(value, dict):
-            counts = firebase_status_summary({key: value})
-            total += counts[0]
-            online += counts[1]
-            offline += counts[2]
-            unknown += counts[3]
-
-        buffer = buffer[value_end:]
-        position = 0
-
 def firebase_base_url(value):
     value = value.strip().strip("/")
     if not re.match(r"^https?://", value, re.I):
@@ -1419,47 +1192,66 @@ def firebase_base_url(value):
 
 def read_firebase_status(url):
     base_url = firebase_base_url(url)
-    try:
-        headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0"}
-        root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
-        endpoint = root_url + "/clients.json"
-        with urlopen(Request(endpoint, headers=headers), timeout=30) as response:
-            return firebase_status_summary_stream(response)
-    except HTTPError as exc:
-        if exc.code in {400, 404}:
-            raise ValueError("Ye wrong ya deactivated Firebase hai. Please send another Firebase URL.") from exc
-        if exc.code in {401, 403}:
-            raise ValueError("Firebase active hai, lekin access denied hai. Rules/auth check karein ya another URL send karein.") from exc
-        raise ValueError(f"Firebase read failed (HTTP {exc.code}). Please send another URL.") from exc
-    except ValueError:
-        raise
-    except Exception as exc:
-        error_text = str(exc)
-        if "getaddrinfo failed" in error_text or "11001" in error_text:
-            raise ValueError("Ye wrong ya deactivated Firebase hai. Please send another Firebase URL.") from exc
-        if "JSON" in error_text or "Expecting value" in error_text:
-            raise ValueError("Ye wrong Firebase response hai. Please send another Firebase URL.") from exc
-        raise ValueError(f"Firebase check failed. Please send another URL: {error_text[:140]}") from exc
+    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0"}
+    root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
+    
+    # Try common database paths: clients, All_User, devices, or root
+    paths_to_try = ["/clients.json", "/All_User.json", "/devices.json", "/users.json", "/.json?shallow=true"]
+    last_err = None
+    found_active = False
 
-def read_firebase_status_fast(url):
-    return read_firebase_status(url)
+    for p in paths_to_try:
+        try:
+            endpoint = root_url + p
+            with urlopen(Request(endpoint, headers=headers), timeout=2.0) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data is not None:
+                found_active = True
+                if isinstance(data, dict):
+                    # Check if this node has device records
+                    summary = firebase_status_summary(data)
+                    if summary[0] > 0 or p == paths_to_try[0]:
+                        return summary
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+            last_err = exc
+        except Exception as exc:
+            last_err = exc
+
+    if found_active:
+        return 0, 0, 0, 0
+
+    if last_err:
+        err_msg = str(last_err)
+        if isinstance(last_err, HTTPError):
+            if last_err.code in {400, 404}:
+                raise ValueError("Ye wrong ya deactivated Firebase hai.")
+            raise ValueError(f"HTTP Error {last_err.code}")
+        if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg:
+            raise ValueError("Ye wrong ya deactivated Firebase hai.")
+        if "timed out" in err_msg.lower():
+            raise ValueError("Connection timed out (Slow).")
+        raise ValueError(f"Check failed: {err_msg[:100]}")
+    raise ValueError("Ye Firebase deactivate hai.")
+
+def read_firebase_status_fast(url, deadline=3.0):
+    try:
+        return read_firebase_status(url)
+    except Exception as exc:
+        raise exc
 
 def check_viewer_target(target):
     try:
-        return "active", (target, *read_firebase_status(target))
+        res = read_firebase_status_fast(target)
+        if isinstance(res, tuple) and res[0] == "protected":
+            return "protected", (target, "Protected By Auth (Firebase is active and you can use it only using correct auth/password)", 0, 0, 0, 0)
+        return "active", (target, *res)
     except Exception as exc:
-        return "inactive", (target, str(exc)[:250])
-
-def check_viewer_targets(targets):
-    """Check targets in bounded batches so a large request queues few futures."""
-    results = []
-    batch_size = 100
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="viewer-check") as pool:
-        for offset in range(0, len(targets), batch_size):
-            batch = targets[offset:offset + batch_size]
-            for target, result in zip(batch, pool.map(check_viewer_target, batch)):
-                results.append(result)
-    return results
+        err_msg = str(exc)
+        if "Protected Rules" in err_msg or "Access Denied" in err_msg or "auth/password" in err_msg.lower():
+            return "protected", (target, "Protected By Auth (Firebase is active and you can use it only using correct auth/password)", 0, 0, 0, 0)
+        return "inactive", (target, err_msg[:250])
 
 def process_firebase_view(message):
     uid, chat = message["from"]["id"], message["chat"]["id"]
@@ -1497,19 +1289,20 @@ def process_firebase_view(message):
     viewer_slot_acquired = True
 
     cost = 0.5 * len(targets)
-    charged = False
+    user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
+    if user.get("diamonds", 0) < cost:
+        send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 {format_diamonds(cost)} Diamond to use Firebase Viewer.")
+        session(uid)
+        VIEWER_SLOTS.release()
+        with LIMIT_LOCK:
+            active_viewer_users.discard(uid)
+        return
+    update_balance(uid, -cost)
     progress_message = None
     successful = 0
     active_results = []
     inactive_results = []
     try:
-        user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
-        if user.get("diamonds", 0) < cost:
-            send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 {format_diamonds(cost)} Diamond to use Firebase Viewer.")
-            return
-        update_balance(uid, -cost)
-        charged = True
-
         try:
             sticker = cfg().get("viewer_sticker", "")
             if sticker:
@@ -1519,62 +1312,106 @@ def process_firebase_view(message):
         except Exception:
             LOG.warning("Viewer progress message failed", exc_info=True)
 
-        checked_results = check_viewer_targets(targets)
+        # Bounded parallelism keeps large requests fast without creating one
+        # unbounded thread per URL. The per-target timeout still applies.
+        with ThreadPoolExecutor(max_workers=min(8, len(targets)), thread_name_prefix="viewer-check") as pool:
+            checked_results = list(pool.map(check_viewer_target, targets))
 
+        protected_results = []
         for category, record in checked_results:
             if category == "active":
                 successful += 1
                 active_results.append(record)
+            elif category == "protected":
+                protected_results.append(record)
             else:
                 inactive_results.append(record)
 
-        # Small requests keep the detailed legacy messages. For 10+ URLs,
-        # grouped pages avoid flooding Telegram and are followed by one TXT
-        # containing active URLs only.
-        if len(targets) < 10:
+        # Line-by-line smooth clean UI reporting
+        if len(targets) <= 15:
             for index, (category, record) in enumerate(checked_results, 1):
                 try:
                     if category == "active":
                         target, total, online, offline, unknown = record
-                        send(chat, f"✅ <b>Firebase Active ({index}/{len(targets)})</b>\n\n<code>{esc(target)}</code>\n\n📊 Total Numbers: <b>{total}</b>\n🟢 Online: <b>{online}</b>\n🔴 Offline: <b>{offline}</b>\n⚪ Unknown: <b>{unknown}</b>\n📌 Status: <b>Working</b>")
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: 🟢 <b>WORKING / ACTIVE</b>\n"
+                            f"📊 Total Devices: <b>{total}</b> | 🟢 Online: <b>{online}</b> | 🔴 Offline: <b>{offline}</b>"
+                        ))
+                    elif category == "protected":
+                        target = record[0]
+                        total = record[2] if len(record) > 2 else 0
+                        online = record[3] if len(record) > 3 else 0
+                        offline = record[4] if len(record) > 4 else 0
+                        device_info = f"\n📊 Total Devices: <b>{total}</b> | 🟢 Online: <b>{online}</b> | 🔴 Offline: <b>{offline}</b>" if total > 0 else ""
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: ⚠️ <b>PROTECTED BY AUTH</b> (<i>Firebase is active and you can use it only using correct auth/password</i>)"
+                            f"{device_info}"
+                        ))
                     else:
                         target, reason = record
-                        send(chat, f"❌ <b>Firebase {index}/{len(targets)} Failed</b>\n\n<code>{esc(target)}</code>\n\n{esc(reason)}")
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: 🔴 <b>DEACTIVATED</b>\n"
+                            f"⚠️ Reason: <i>{esc(reason)}</i>"
+                        ))
                 except Exception:
                     LOG.warning("Viewer result message failed for item %d", index, exc_info=True)
 
-        if len(targets) >= 10:
+        if len(targets) > 15:
             try:
-                send_viewer_result_pages(chat, active_results, inactive_results)
+                send_viewer_result_pages(chat, active_results, protected_results, inactive_results)
             except Exception:
                 LOG.exception("Grouped viewer result delivery failed")
+
+        # In bulk checks (or whenever found), send 2 separate TXT files:
+        # 1. 🟢 Working / Active TXT
+        # 2. ⚠️ Protected By Auth TXT
+        if len(targets) >= 10:
             if active_results:
                 active_urls = list(dict.fromkeys(record[0] for record in active_results))
                 try:
-                    send_extraction_txt(chat, "Active Firebase Viewer Results", active_urls)
+                    send_extraction_txt(chat, "🟢 WORKING ACTIVE FIREBASE RESULTS", active_urls)
                 except Exception:
                     LOG.exception("Active viewer TXT delivery failed")
-        send_completion_summary(chat, "Viewer", targets, cost, len(targets), f"{successful}/{len(targets)} checked")
+            if protected_results:
+                protected_urls = list(dict.fromkeys(record[0] for record in protected_results))
+                try:
+                    send_extraction_txt(chat, "⚠️ PROTECTED BY AUTH FIREBASE RESULTS", protected_urls)
+                except Exception:
+                    LOG.exception("Protected viewer TXT delivery failed")
+        
+        # Summary message
+        summary_msg = (
+            f"🎯 <b>Checking Complete!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 Total Checked: <b>{len(targets)}</b>\n"
+            f"🟢 Active / Working: <b>{len(active_results)}</b>\n"
+            f"⚠️ Protected By Auth: <b>{len(protected_results)}</b>\n"
+            f"🔴 Deactivated / Inactive: <b>{len(inactive_results)}</b>\n"
+            f"💎 Cost Used: <b>{format_diamonds(cost)}</b> Diamonds"
+        )
+        send(chat, summary_msg)
     except Exception as exc:
-        if charged:
-            try:
-                update_balance(uid, cost)
-            except Exception:
-                LOG.exception("Viewer refund failed for user %s", uid)
-        try:
-            refund_text = f"\n🔄 💎 <b>{format_diamonds(cost)} Diamond Refunded</b>." if charged else ""
-            send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>{refund_text}")
-        except Exception:
-            LOG.exception("Viewer error notification failed for user %s", uid)
+        update_balance(uid, cost)
+        send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>\n🔄 💎 <b>{format_diamonds(cost)} Diamond Refunded</b>.")
     finally:
+        if progress_message and progress_message.get("message_id"):
+            delete_message(chat, progress_message["message_id"])
+        session(uid)
         if viewer_slot_acquired:
             VIEWER_SLOTS.release()
         if viewer_claimed:
             with LIMIT_LOCK:
                 active_viewer_users.discard(uid)
-        if progress_message and progress_message.get("message_id"):
-            delete_message(chat, progress_message["message_id"])
-        session(uid)
+        gc.collect()
     another_task_prompt(chat)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1754,6 +1591,7 @@ def process_extraction(message):
             with LIMIT_LOCK:
                 active_extraction_users.discard(uid)
         session(uid)
+        gc.collect()
     another_task_prompt(chat)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1860,7 +1698,6 @@ def handle_admin_input(message, state, text):
                     if channel.get("chat_id") == chat_id:
                         channel["invite_url"] = text
                         break
-            clear_membership_cache()
             session(uid); send(chat, "✅ Channel and invite link saved.", kb([[btn("🔙 Back", "admin:channels")]]))
         else:
             send(chat, "Send a valid invite link or type <code>skip</code>.")
@@ -1883,7 +1720,6 @@ def handle_admin_input(message, state, text):
         else:
             fallback_channels[:] = [x for x in fallback_channels if x.get("chat_id") != origin["id"]]
             fallback_channels.append(channel)
-        clear_membership_cache()
         if channel["invite_url"]:
             session(uid); send(chat, "✅ Channel/group added successfully.", kb([[btn("🔙 Back", "admin:channels")]]))
         else:
@@ -2017,14 +1853,12 @@ def drain_apk_queue(uid):
 # ═══════════════════════════════════════════════════════════════
 # CALLBACK QUERY ROUTING
 # ═══════════════════════════════════════════════════════════════
-def callback(q, callback_answered=False):
+def callback(q):
     msg = q.get("message", {})
     if not is_private_chat(msg):
-        if not callback_answered:
-            answer(q, "Please use the bot in private chat.")
+        answer(q, "Please use the bot in private chat.")
         return
-    if not callback_answered:
-        answer(q)
+    answer(q)
     time.sleep(CALLBACK_REPLY_DELAY_SECONDS)
     data = q.get("data", "").split(":"); action, value = data[0], data[1] if len(data) > 1 else ""
     uid = q["from"]["id"]; chat = msg.get("chat", {}).get("id", uid); mid = msg.get("message_id")
@@ -2203,7 +2037,6 @@ def callback(q, callback_answered=False):
                 channels.delete_one({"chat_id":int(data[2])})
             else:
                 fallback_channels[:] = [x for x in fallback_channels if x.get("chat_id") != int(data[2])]
-            clear_membership_cache()
             admin_channels(chat,mid)
         elif action == "image" and is_admin(uid): session(uid,{"action":"image","key":value}); edit(chat,mid,"📷 Send the image photo now.",kb([[btn("🔙 Back","admin:images")]]))
     except Exception: LOG.exception("callback failed: %s", q.get("data"))
@@ -2273,12 +2106,13 @@ def handle_message(msg_obj):
         return process_extraction(msg_obj)
 
     if state_action == "firebase_view":
-        # Do not gate this on a generic URL regex: Base64-wrapped Firebase
-        # links and messages containing several endpoints are valid viewer
-        # inputs too. The viewer parser is the source of truth.
         if not firebase_targets_from_text(text):
             send(chat, "⚠️ Please send a valid Firebase Realtime Database URL.")
             return
+        return process_firebase_view(msg_obj)
+
+    # Auto-detection: If user directly sends Firebase URL(s) without menu, check them immediately
+    if firebase_targets_from_text(text):
         return process_firebase_view(msg_obj)
 
     if state == "buy":
@@ -2312,9 +2146,37 @@ def handle_message(msg_obj):
 # ═══════════════════════════════════════════════════════════════
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b'{"status":"ok","service":"firebase-bot"}' if self.path in {"/healthz","/api/healthz"} else b""
-        self.send_response(200 if body else 404); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def log_message(self,*args): pass
+        # Respond 200 to all keepalive and health check endpoints
+        if self.path in {"/", "/healthz", "/api/healthz", "/ping", "/status"}:
+            body = b'{"status":"ok","service":"firebase-bot","alive":true}'
+            self.send_response(200)
+        else:
+            body = b'{"status":"not_found"}'
+            self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args): pass
+
+def self_ping_loop():
+    """Keep bot online 24/7 on Render / PaaS free tiers by pinging its own URL every 10 minutes."""
+    url = os.getenv("RENDER_EXTERNAL_URL", "https://hoatingbot.onrender.com").strip().rstrip("/")
+    target = f"{url}/healthz"
+    LOG.info("Keepalive self-ping initialized for %s", target)
+    time.sleep(30)
+    while True:
+        try:
+            req = Request(target, headers={"User-Agent": "Bot-KeepAlive/2.0"})
+            with urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    LOG.debug("Keepalive ping successful (%s)", resp.status)
+        except Exception as exc:
+            LOG.warning("Keepalive self-ping ping error: %s", exc)
+        time.sleep(600)  # Ping every 10 minutes to stay awake permanently
 
 def flush_media_group(group_id):
     group_messages = pending_media_groups.pop(group_id, [])
@@ -2360,55 +2222,20 @@ def queue_media_group_message(msg):
     return True
 
 
-def restart_process(reason):
-    LOG.critical("%s; restarting bot process", reason)
-    try:
-        os.execv(sys.executable, [sys.executable, *sys.argv])
-    except OSError:
-        LOG.exception("Could not replace the bot process; exiting for the host to restart it")
-        os._exit(1)
-
-
-def restart_on_main_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    LOG.critical(
-        "Uncaught main-thread exception",
-        exc_info=(exc_type, exc_value, exc_traceback),
-    )
-    restart_process("Uncaught main-thread exception")
-
-
-def restart_on_thread_exception(args):
-    if issubclass(args.exc_type, SystemExit):
-        return
-    LOG.critical(
-        "Uncaught exception in thread %s",
-        args.thread.name,
-        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-    )
-    restart_process(f"Uncaught exception in thread {args.thread.name}")
-
-
-def install_crash_restart_hooks():
-    sys.excepthook = restart_on_main_exception
-    threading.excepthook = restart_on_thread_exception
-
-
 def bot_watchdog():
     while True:
         time.sleep(30)
         if time.monotonic() - last_poll_at > 180:
-            restart_process("Polling appears frozen")
+            LOG.error("Polling appears frozen; restarting bot process")
+            os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def main():
     global BOT_USERNAME
-    install_crash_restart_hooks()
     if not TOKEN: LOG.error("Configure TELEGRAM_BOT_TOKEN in environment variables."); return
     setup_db(); BOT_USERNAME = (tg("getMe") or {}).get("username","your_bot")
     threading.Thread(target=backup_loop, daemon=True, name="mongodb-backup").start()
+    threading.Thread(target=self_ping_loop, daemon=True, name="self-keepalive").start()
     
     port = int(os.getenv("PORT", "8099"))
     try:
@@ -2430,7 +2257,7 @@ def main():
             for update in updates:
                 offset = update["update_id"]
                 if update.get("callback_query"): 
-                    submit_callback(update["callback_query"])
+                    submit_user_work(callback, update["callback_query"])
                 elif update.get("message"):
                     message = update["message"]
                     if queue_media_group_message(message):
