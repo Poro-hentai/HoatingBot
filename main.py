@@ -62,10 +62,10 @@ FIREBASE_REGEX = re.compile(r"(^|\.)firebaseio\.com$|(^|\.)firebasedatabase\.app
 MAX_FILE = 50 * 1024 * 1024  # Extended to 100MB File Limit
 MAX_ENTRY = 20 * 1024 * 1024
 MAX_SCAN = 40 * 1024 * 1024
-MAX_VIEWER_SCAN = 5 * 1024 * 1024
-MAX_VIEWER_TARGETS = max(1, env_int("MAX_VIEWER_TARGETS", 10000))
+MAX_VIEWER_SCAN = 50 * 1024 * 1024
+MAX_VIEWER_TARGETS = max(1, env_int("MAX_VIEWER_TARGETS", 100000))
 MAX_PENDING_APKS_PER_USER = max(1, env_int("MAX_PENDING_APKS_PER_USER", 3))
-MAX_QUEUED_WORK = max(8, env_int("MAX_QUEUED_WORK", 64))
+MAX_QUEUED_WORK = max(8, env_int("MAX_QUEUED_WORK", 128))
 START_REPLY_DELAY_SECONDS = 0
 CALLBACK_REPLY_DELAY_SECONDS = 0
 MAX_ARCHIVE_ENTRIES = 10000
@@ -94,10 +94,10 @@ fallback_settings = {
 captcha_challenges = {}
 verified_users = set()
 BOT_USERNAME = "your_bot"
-WORKERS = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bot-worker")
+WORKERS = ThreadPoolExecutor(max_workers=20, thread_name_prefix="bot-worker")
 WORK_DISPATCH_SLOTS = threading.BoundedSemaphore(MAX_QUEUED_WORK)
-EXTRACTION_SLOTS = threading.BoundedSemaphore(2)
-VIEWER_SLOTS = threading.BoundedSemaphore(4)
+EXTRACTION_SLOTS = threading.BoundedSemaphore(4)
+VIEWER_SLOTS = threading.BoundedSemaphore(12)
 LIMIT_LOCK = threading.Lock()
 active_extraction_users = set()
 active_viewer_users = set()
@@ -183,13 +183,16 @@ def delete_message(chat_id, message_id):
     except Exception:
         LOG.debug("Unable to delete Telegram message %s", message_id, exc_info=True)
 
-def send_document(chat_id, file_path):
+def send_document(chat_id, file_path, caption=None):
     boundary = "----FirebaseBackupBoundary"
     content = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode()]
+    if caption:
+        content.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode())
+        content.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n".encode())
     mime_type = "text/plain" if Path(file_path).suffix.lower() in {".txt", ".text", ".log"} else "application/json"
     content.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{Path(file_path).name}\"\r\nContent-Type: {mime_type}\r\n\r\n".encode() + Path(file_path).read_bytes() + b"\r\n")
     content.append(f"--{boundary}--\r\n".encode())
-    response = urlopen(Request(f"{API}/sendDocument", data=b"".join(content), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}), timeout=35)
+    response = urlopen(Request(f"{API}/sendDocument", data=b"".join(content), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}), timeout=45)
     result = json.loads(response.read().decode())
     if not result.get("ok"):
         raise RuntimeError(result.get("description", "Telegram file upload failed"))
@@ -955,15 +958,30 @@ def looks_like_firebase_url(text):
 def firebase_targets_from_text(text):
     """Return unique Firebase endpoints from raw, bare, or Base64-wrapper URLs."""
     targets = []
-    # Parse the complete payload first so a Base64-only value can be decoded;
-    # then parse normalized explicit URLs as a compatibility fallback.
-    source_values = [text or ""] + extract_input_urls(text)
+    seen = set()
+    raw_text = text or ""
+    # For large text / files (e.g. 10,000+ links), use fast bulk regex scanning
+    if len(raw_text) > 20000:
+        raw_urls = re.findall(r"https?://[^\s<>\"'`|]+|(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.)?(?:firebaseio\.com|firebasedatabase\.app|firebaseapp\.com)(?:/[^\s<>\"'`|]*)?", raw_text, re.I)
+        for raw in raw_urls:
+            raw = raw.strip()
+            if not raw:
+                continue
+            clean = normalize_firebase_url(raw if raw.startswith(("http://", "https://")) else "https://" + raw)
+            if clean and clean not in seen:
+                seen.add(clean)
+                targets.append(clean)
+        if targets:
+            return targets
+
+    source_values = [raw_text] + extract_input_urls(raw_text)
     for source_url in source_values:
         candidates = endpoint_urls(source_url)
         if not candidates and looks_like_firebase_url(source_url):
             candidates = endpoint_urls("https://" + source_url)
         for target in candidates:
-            if target not in targets:
+            if target not in seen:
+                seen.add(target)
                 targets.append(target)
     return targets
 
@@ -988,6 +1006,52 @@ def send_extraction_txt(chat, title, urls):
     finally:
         if result_path:
             result_path.unlink(missing_ok=True)
+
+def send_active_firebase_txt(chat, urls):
+    temp_dir = tempfile.gettempdir()
+    filepath = Path(temp_dir) / f"Active_Firebase_{int(time.time())}.txt"
+    try:
+        content = "\n".join(urls)
+        filepath.write_text(content, encoding="utf-8")
+        caption = (
+            f"🟢 <b>Active Firebase Found ({len(urls):,})</b>\n\n"
+            f"Ye lo aapki saari working/active Firebase URLs ki list.\n"
+            f"Total Active: <b>{len(urls):,}</b>"
+        )
+        send_document(chat, filepath, caption=caption)
+        return True
+    except Exception as exc:
+        LOG.exception("Failed to send active firebase txt")
+        send(chat, f"❌ Active file send karne me error: <code>{esc(str(exc)[:200])}</code>")
+        return False
+    finally:
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except Exception:
+                pass
+
+def send_protected_firebase_txt(chat, urls):
+    temp_dir = tempfile.gettempdir()
+    filepath = Path(temp_dir) / f"Protected_Firebase_{int(time.time())}.txt"
+    try:
+        content = "\n".join(urls)
+        filepath.write_text(content, encoding="utf-8")
+        caption = (
+            f"⚠️ <b>Protected By Auth Firebase ({len(urls):,})</b>\n\n"
+            f"Ye URLs active hain par Auth/Rules se protected hain.\n"
+            f"Total Protected: <b>{len(urls):,}</b>"
+        )
+        send_document(chat, filepath, caption=caption)
+        return True
+    except Exception:
+        return False
+    finally:
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except Exception:
+                pass
 
 def user_history_firebase_urls(uid):
     """Return only this user's unique Firebase URLs, newest first."""
@@ -1192,7 +1256,7 @@ def firebase_base_url(value):
 
 def read_firebase_status(url):
     base_url = firebase_base_url(url)
-    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0"}
+    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close"}
     root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
     
     # Try common database paths: clients, All_User, devices, or root
@@ -1203,7 +1267,7 @@ def read_firebase_status(url):
     for p in paths_to_try:
         try:
             endpoint = root_url + p
-            with urlopen(Request(endpoint, headers=headers), timeout=2.0) as response:
+            with urlopen(Request(endpoint, headers=headers), timeout=1.5) as response:
                 data = json.loads(response.read().decode("utf-8"))
             if data is not None:
                 found_active = True
@@ -1215,8 +1279,15 @@ def read_firebase_status(url):
         except HTTPError as exc:
             if exc.code in {401, 403}:
                 return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+            if exc.code in {400, 404}:
+                last_err = exc
+                break
             last_err = exc
         except Exception as exc:
+            err_msg = str(exc)
+            if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg or "Connection refused" in err_msg:
+                last_err = exc
+                break
             last_err = exc
 
     if found_active:
@@ -1257,13 +1328,14 @@ def process_firebase_view(message):
     uid, chat = message["from"]["id"], message["chat"]["id"]
     LOG.info("Firebase Viewer request from user %s", uid)
     targets = firebase_targets_from_text(message.get("text", ""))
+    targets = list(dict.fromkeys(targets))
     if not targets:
-        send(chat, "⚠️ Please send one or more valid Firebase URLs, raw or Base64-wrapped.")
+        send(chat, "⚠️ Please send one or more valid Firebase URLs or a .txt file containing them.")
         return
     if len(targets) > MAX_VIEWER_TARGETS:
         send(
             chat,
-            f"⚠️ Too many Firebase URLs in one request. Maximum is <b>{MAX_VIEWER_TARGETS}</b>. "
+            f"⚠️ Too many Firebase URLs in one request. Maximum is <b>{MAX_VIEWER_TARGETS:,}</b>. "
             "Please split them into smaller batches.",
         )
         session(uid)
@@ -1279,132 +1351,179 @@ def process_firebase_view(message):
             active_viewer_users.add(uid)
             viewer_claimed = True
     if viewer_already_active:
-        send(chat, "⏳ Your previous Firebase Viewer request is still running. Please wait.")
+        send(chat, "⏳ Aapki pichli Firebase scanning abhi chal rahi hai. Kripya thoda intezar karein.")
         return
     if not VIEWER_SLOTS.acquire(blocking=False):
         with LIMIT_LOCK:
             active_viewer_users.discard(uid)
-        send(chat, "⏳ Too many Firebase Viewer checks are running. Please try again in a moment.")
+        send(chat, "⏳ Too many Firebase Viewer checks are currently running. Please try again in a moment.")
         return
     viewer_slot_acquired = True
 
-    cost = 0.5 * len(targets)
+    is_adm = is_admin(uid)
+    cost = 0 if is_adm else 0.5
     user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
-    if user.get("diamonds", 0) < cost:
+    user = user or {}
+    if not is_adm and user.get("diamonds", 0) < cost:
         send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 {format_diamonds(cost)} Diamond to use Firebase Viewer.")
         session(uid)
         VIEWER_SLOTS.release()
         with LIMIT_LOCK:
             active_viewer_users.discard(uid)
         return
-    update_balance(uid, -cost)
-    progress_message = None
+    if cost > 0:
+        update_balance(uid, -cost)
+
+    progress_mid = None
+    start_time = time.time()
+    total = len(targets)
     successful = 0
     active_results = []
+    protected_results = []
     inactive_results = []
+    checked_count = 0
+    last_edit_time = 0.0
+
     try:
-        try:
-            sticker = cfg().get("viewer_sticker", "")
-            if sticker:
-                progress_message = send_sticker(chat, sticker)
-            else:
-                progress_message = send(chat, f"🔎 <b>Checking {len(targets)} Firebase URL(s)...</b>")
-        except Exception:
-            LOG.warning("Viewer progress message failed", exc_info=True)
-
-        # Bounded parallelism keeps large requests fast without creating one
-        # unbounded thread per URL. The per-target timeout still applies.
-        with ThreadPoolExecutor(max_workers=min(8, len(targets)), thread_name_prefix="viewer-check") as pool:
-            checked_results = list(pool.map(check_viewer_target, targets))
-
-        protected_results = []
-        for category, record in checked_results:
-            if category == "active":
-                successful += 1
-                active_results.append(record)
-            elif category == "protected":
-                protected_results.append(record)
-            else:
-                inactive_results.append(record)
-
-        # Line-by-line smooth clean UI reporting
-        if len(targets) <= 15:
-            for index, (category, record) in enumerate(checked_results, 1):
-                try:
-                    if category == "active":
-                        target, total, online, offline, unknown = record
-                        send(chat, (
-                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"🔗 <code>{esc(target)}</code>\n"
-                            f"📌 Status: 🟢 <b>WORKING / ACTIVE</b>\n"
-                            f"📊 Total Devices: <b>{total}</b> | 🟢 Online: <b>{online}</b> | 🔴 Offline: <b>{offline}</b>"
-                        ))
-                    elif category == "protected":
-                        target = record[0]
-                        total = record[2] if len(record) > 2 else 0
-                        online = record[3] if len(record) > 3 else 0
-                        offline = record[4] if len(record) > 4 else 0
-                        device_info = f"\n📊 Total Devices: <b>{total}</b> | 🟢 Online: <b>{online}</b> | 🔴 Offline: <b>{offline}</b>" if total > 0 else ""
-                        send(chat, (
-                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"🔗 <code>{esc(target)}</code>\n"
-                            f"📌 Status: ⚠️ <b>PROTECTED BY AUTH</b> (<i>Firebase is active and you can use it only using correct auth/password</i>)"
-                            f"{device_info}"
-                        ))
-                    else:
-                        target, reason = record
-                        send(chat, (
-                            f"⚡ <b>Firebase Check ({index}/{len(targets)})</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"🔗 <code>{esc(target)}</code>\n"
-                            f"📌 Status: 🔴 <b>DEACTIVATED</b>\n"
-                            f"⚠️ Reason: <i>{esc(reason)}</i>"
-                        ))
-                except Exception:
-                    LOG.warning("Viewer result message failed for item %d", index, exc_info=True)
-
-        if len(targets) > 15:
-            try:
-                send_viewer_result_pages(chat, active_results, protected_results, inactive_results)
-            except Exception:
-                LOG.exception("Grouped viewer result delivery failed")
-
-        # In bulk checks (or whenever found), send 2 separate TXT files:
-        # 1. 🟢 Working / Active TXT
-        # 2. ⚠️ Protected By Auth TXT
-        if len(targets) >= 10:
-            if active_results:
-                active_urls = list(dict.fromkeys(record[0] for record in active_results))
-                try:
-                    send_extraction_txt(chat, "🟢 WORKING ACTIVE FIREBASE RESULTS", active_urls)
-                except Exception:
-                    LOG.exception("Active viewer TXT delivery failed")
-            if protected_results:
-                protected_urls = list(dict.fromkeys(record[0] for record in protected_results))
-                try:
-                    send_extraction_txt(chat, "⚠️ PROTECTED BY AUTH FIREBASE RESULTS", protected_urls)
-                except Exception:
-                    LOG.exception("Protected viewer TXT delivery failed")
-        
-        # Summary message
-        summary_msg = (
-            f"🎯 <b>Checking Complete!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 Total Checked: <b>{len(targets)}</b>\n"
-            f"🟢 Active / Working: <b>{len(active_results)}</b>\n"
-            f"⚠️ Protected By Auth: <b>{len(protected_results)}</b>\n"
-            f"🔴 Deactivated / Inactive: <b>{len(inactive_results)}</b>\n"
-            f"💎 Cost Used: <b>{format_diamonds(cost)}</b> Diamonds"
+        initial_bar = "░" * 16
+        initial_text = (
+            f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<code>[{initial_bar}] 0.0%</code>\n\n"
+            f"🚀 <b>Scan Speed:</b> <code>Starting...</code>\n"
+            f"⏳ <b>ETA Left:</b> <code>Calculating...</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
+            f"📊 <b>Live Progress:</b>\n"
+            f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
+            f"├ ⚡ <b>Checked:</b> <code>0</code>\n"
+            f"├ ⏳ <b>Pending:</b> <code>{total:,}</code>\n"
+            f"├ 🟢 <b>Active:</b> <code>0</code>\n"
+            f"├ ⚠️ <b>Auth Protected:</b> <code>0</code>\n"
+            f"└ 🔴 <b>Dead / Deactive:</b> <code>0</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Turbo multi-thread engine active...</i>"
         )
-        send(chat, summary_msg)
+        progress_message = send(chat, initial_text)
+        if progress_message and isinstance(progress_message, dict):
+            progress_mid = progress_message.get("message_id")
+
+        # Turbo Multi-Threading: up to 120 parallel workers for lightning scans
+        max_workers = min(120, max(10, total))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="viewer-check") as pool:
+            futures = {pool.submit(check_viewer_target, target): target for target in targets}
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    category, record = future.result()
+                except Exception as exc:
+                    category, record = "inactive", (target, str(exc)[:250])
+
+                if category == "active":
+                    successful += 1
+                    active_results.append(record)
+                elif category == "protected":
+                    protected_results.append(record)
+                else:
+                    inactive_results.append(record)
+
+                checked_count += 1
+
+                now_time = time.time()
+                # Throttled live update (1.5s) to guarantee zero Telegram rate-limit drops
+                if progress_mid and (now_time - last_edit_time >= 1.5 or checked_count == total):
+                    elapsed = max(0.1, now_time - start_time)
+                    percent = (checked_count / total) * 100.0
+                    bar_width = 16
+                    filled = int(round(bar_width * percent / 100.0))
+                    filled = min(bar_width, max(0, filled))
+                    empty = bar_width - filled
+                    bar = "█" * filled + "░" * empty
+
+                    rate = checked_count / elapsed if elapsed > 0 else 0
+                    if rate > 0 and checked_count < total:
+                        rem_sec = int((total - checked_count) / rate)
+                        m, s = divmod(rem_sec, 60)
+                        h, m = divmod(m, 60)
+                        est_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+                    elif checked_count >= total:
+                        est_str = "00:00"
+                    else:
+                        est_str = "Calculating..."
+
+                    el_m, el_s = divmod(int(elapsed), 60)
+                    el_h, el_m = divmod(el_m, 60)
+                    elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}" if el_h > 0 else f"{el_m:02d}:{el_s:02d}"
+
+                    update_text = (
+                        f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<code>[{bar}] {percent:.1f}%</code>\n\n"
+                        f"🚀 <b>Scan Speed:</b> <code>{int(rate)} URLs/sec</code>\n"
+                        f"⏳ <b>ETA Left:</b> <code>{est_str}</code> | ⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
+                        f"📊 <b>Live Progress:</b>\n"
+                        f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
+                        f"├ ⚡ <b>Checked:</b> <code>{checked_count:,}</code>\n"
+                        f"├ ⏳ <b>Pending:</b> <code>{total - checked_count:,}</code>\n"
+                        f"├ 🟢 <b>Active:</b> <code>{len(active_results):,}</code>\n"
+                        f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
+                        f"└ 🔴 <b>Dead / Deactive:</b> <code>{len(inactive_results):,}</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<i>Turbo multi-thread engine active...</i>"
+                    )
+                    try:
+                        edit(chat, progress_mid, update_text)
+                        last_edit_time = now_time
+                    except Exception:
+                        pass
+
+        total_elapsed = max(0.1, time.time() - start_time)
+        tot_m, tot_s = divmod(int(total_elapsed), 60)
+        tot_h, tot_m = divmod(tot_m, 60)
+        tot_elapsed_str = f"{tot_h:02d}:{tot_m:02d}:{tot_s:02d}" if tot_h > 0 else f"{tot_m:02d}:{tot_s:02d}"
+        avg_rate = checked_count / total_elapsed if total_elapsed > 0 else 0
+
+        bar_complete = "█" * 16
+        summary_msg = (
+            f"✅ <b>FIREBASE SCANNING COMPLETED!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<code>[{bar_complete}] 100.0%</code>\n\n"
+            f"📊 <b>Final Performance Summary:</b>\n"
+            f"├ 📋 <b>Total Checked:</b> <code>{total:,}</code>\n"
+            f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
+            f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
+            f"├ 🔴 <b>Dead / Deactive:</b> <code>{len(inactive_results):,}</code>\n"
+            f"├ ⏱️ <b>Total Time:</b> <code>{tot_elapsed_str}</code>\n"
+            f"├ 🚀 <b>Average Speed:</b> <code>{int(avg_rate)} URLs/sec</code>\n"
+            f"└ 💎 <b>Diamonds Used:</b> <code>{format_diamonds(cost)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 <i>Active Firebase result file is delivered below.</i>"
+        )
+        if progress_mid:
+            try:
+                edit(chat, progress_mid, summary_msg)
+            except Exception:
+                send(chat, summary_msg)
+        else:
+            send(chat, summary_msg)
+
+        # Deliver Active Firebase TXT file
+        if active_results:
+            active_urls = list(dict.fromkeys(record[0] for record in active_results))
+            send_active_firebase_txt(chat, active_urls)
+        else:
+            send(chat, f"ℹ️ <b>Scan Complete:</b> Total {total:,} URLs me se koi bhi Active/Working Firebase nahi mila.")
+
+        # Deliver Protected By Auth Firebase TXT file if any found
+        if protected_results:
+            protected_urls = list(dict.fromkeys(record[0] for record in protected_results))
+            if protected_urls:
+                send_protected_firebase_txt(chat, protected_urls)
+
     except Exception as exc:
-        update_balance(uid, cost)
+        LOG.exception("Viewer scanning error")
+        if cost > 0:
+            update_balance(uid, cost)
         send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>\n🔄 💎 <b>{format_diamonds(cost)} Diamond Refunded</b>.")
     finally:
-        if progress_message and progress_message.get("message_id"):
-            delete_message(chat, progress_message["message_id"])
         session(uid)
         if viewer_slot_acquired:
             VIEWER_SLOTS.release()
@@ -2071,31 +2190,35 @@ def handle_message(msg_obj):
     if (msg_obj.get("document") or msg_obj.get("audio")) and not (
         is_admin(uid) and isinstance(state, dict) and state.get("action") == "broadcast"
     ):
-        if state_action == "extract":
-            doc = msg_obj.get("document")
-            file_name = doc.get("file_name", "").lower() if doc else ""
-            is_apk = bool(doc and (file_name.endswith(".apk") or doc.get("mime_type") == "application/vnd.android.package-archive"))
-            if is_apk:
-                return queue_apk_extraction(msg_obj)
-            return process_extraction(msg_obj)
-        if state_action == "firebase_view" and msg_obj.get("document"):
-            doc = msg_obj["document"]
-            file_name = doc.get("file_name", "").lower()
-            is_text_file = file_name.endswith((".txt", ".text", ".log")) or doc.get("mime_type", "").startswith("text/")
-            if not is_text_file:
-                send(chat, "⚠️ Please send a valid <b>.txt</b> file or paste Firebase links as text.")
-                return
+        doc = msg_obj.get("document")
+        file_name = doc.get("file_name", "").lower() if doc else ""
+        is_apk = bool(doc and (file_name.endswith(".apk") or doc.get("mime_type") == "application/vnd.android.package-archive"))
+        is_text_file = bool(doc and (file_name.endswith((".txt", ".text", ".log", ".csv", ".json")) or doc.get("mime_type", "").startswith("text/")))
+
+        if is_apk:
+            return queue_apk_extraction(msg_obj)
+
+        if is_text_file:
             path = None
             try:
                 path = download(doc["file_id"])
                 text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
-                return process_firebase_view({**msg_obj, "text": text_content})
+                targets = firebase_targets_from_text(text_content)
+                if targets or state_action == "firebase_view":
+                    return process_firebase_view({**msg_obj, "text": text_content})
+                elif state_action == "extract":
+                    return process_extraction(msg_obj)
+                else:
+                    send(chat, "⚠️ <b>File Check:</b> Is .txt file me koi valid Firebase URL nahi mila.\n\nKripya valid Firebase Realtime Database URLs wali <b>.txt</b> file bhejein.")
+                    return
             except Exception as exc:
                 send(chat, f"❌ Could not read this text file: <code>{esc(str(exc)[:200])}</code>")
             finally:
                 if path:
                     path.unlink(missing_ok=True)
             return
+
+        send(chat, "⚠️ Kripya <b>.apk</b> file ya Firebase URLs wali <b>.txt</b> file bhejein.")
         return
     if is_admin(uid) and state and handle_admin_input(msg_obj, state, text): return
 
