@@ -1256,55 +1256,57 @@ def firebase_base_url(value):
 
 def read_firebase_status(url):
     base_url = firebase_base_url(url)
-    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close"}
+    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close", "Accept": "application/json"}
     root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
     
-    # Try common database paths: clients, All_User, devices, or root
-    paths_to_try = ["/clients.json", "/All_User.json", "/devices.json", "/users.json", "/.json?shallow=true"]
-    last_err = None
-    found_active = False
-
-    for p in paths_to_try:
-        try:
-            endpoint = root_url + p
-            with urlopen(Request(endpoint, headers=headers), timeout=1.5) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            if data is not None:
-                found_active = True
-                if isinstance(data, dict):
-                    # Check if this node has device records
-                    summary = firebase_status_summary(data)
-                    if summary[0] > 0 or p == paths_to_try[0]:
-                        return summary
-        except HTTPError as exc:
-            if exc.code in {401, 403}:
-                return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
-            if exc.code in {400, 404}:
-                last_err = exc
-                break
-            last_err = exc
-        except Exception as exc:
-            err_msg = str(exc)
-            if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg or "Connection refused" in err_msg:
-                last_err = exc
-                break
-            last_err = exc
-
-    if found_active:
+    # 1. Ultra-fast root probe with shallow=true (detects active/protected/dead in 1 call)
+    try:
+        req = Request(root_url + "/.json?shallow=true", headers=headers)
+        with urlopen(req, timeout=1.2) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        
+        if data is not None and isinstance(data, dict):
+            # Check if this database has common device/client tables
+            for sub in ("clients", "All_User", "devices", "users"):
+                if sub in data:
+                    try:
+                        sub_req = Request(f"{root_url}/{sub}.json", headers=headers)
+                        with urlopen(sub_req, timeout=1.2) as sub_resp:
+                            sub_data = json.loads(sub_resp.read().decode("utf-8"))
+                            if isinstance(sub_data, dict):
+                                summary = firebase_status_summary(sub_data)
+                                if summary[0] > 0:
+                                    return summary
+                    except Exception:
+                        pass
+            return 0, 0, 0, 0
         return 0, 0, 0, 0
 
-    if last_err:
-        err_msg = str(last_err)
-        if isinstance(last_err, HTTPError):
-            if last_err.code in {400, 404}:
-                raise ValueError("Ye wrong ya deactivated Firebase hai.")
-            raise ValueError(f"HTTP Error {last_err.code}")
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            # Root is protected by auth rules, verify /clients.json once
+            try:
+                c_req = Request(root_url + "/clients.json", headers=headers)
+                with urlopen(c_req, timeout=1.2) as c_resp:
+                    c_data = json.loads(c_resp.read().decode("utf-8"))
+                    if isinstance(c_data, dict):
+                        return firebase_status_summary(c_data)
+            except HTTPError as c_exc:
+                if c_exc.code in {401, 403}:
+                    return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+            except Exception:
+                pass
+            return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+        if exc.code in {400, 404}:
+            raise ValueError("Ye wrong ya deactivated Firebase hai.")
+        raise ValueError(f"HTTP Error {exc.code}")
+    except Exception as exc:
+        err_msg = str(exc)
         if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg:
             raise ValueError("Ye wrong ya deactivated Firebase hai.")
         if "timed out" in err_msg.lower():
             raise ValueError("Connection timed out (Slow).")
         raise ValueError(f"Check failed: {err_msg[:100]}")
-    raise ValueError("Ye Firebase deactivate hai.")
 
 def read_firebase_status_fast(url, deadline=3.0):
     try:
@@ -1380,9 +1382,68 @@ def process_firebase_view(message):
     successful = 0
     active_results = []
     protected_results = []
-    inactive_results = []
+    inactive_count = 0
     checked_count = 0
-    last_edit_time = 0.0
+
+    stop_progress = threading.Event()
+
+    def progress_worker():
+        last_rendered = ""
+        while not stop_progress.is_set():
+            stop_progress.wait(2.5)
+            if stop_progress.is_set():
+                break
+
+            curr_checked = checked_count
+            if curr_checked == 0:
+                continue
+
+            now_time = time.time()
+            elapsed = max(0.1, now_time - start_time)
+            percent = (curr_checked / total) * 100.0
+            bar_width = 16
+            filled = int(round(bar_width * percent / 100.0))
+            filled = min(bar_width, max(0, filled))
+            empty = bar_width - filled
+            bar = "█" * filled + "░" * empty
+
+            rate = curr_checked / elapsed if elapsed > 0 else 0
+            if rate > 0 and curr_checked < total:
+                rem_sec = int((total - curr_checked) / rate)
+                m, s = divmod(rem_sec, 60)
+                h, m = divmod(m, 60)
+                est_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+            elif curr_checked >= total:
+                est_str = "00:00"
+            else:
+                est_str = "Calculating..."
+
+            el_m, el_s = divmod(int(elapsed), 60)
+            el_h, el_m = divmod(el_m, 60)
+            elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}" if el_h > 0 else f"{el_m:02d}:{el_s:02d}"
+
+            update_text = (
+                f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>[{bar}] {percent:.1f}%</code>\n\n"
+                f"🚀 <b>Scan Speed:</b> <code>{int(rate)} URLs/sec</code>\n"
+                f"⏳ <b>ETA Left:</b> <code>{est_str}</code> | ⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
+                f"📊 <b>Live Progress:</b>\n"
+                f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
+                f"├ ⚡ <b>Checked:</b> <code>{curr_checked:,}</code>\n"
+                f"├ ⏳ <b>Pending:</b> <code>{total - curr_checked:,}</code>\n"
+                f"├ 🟢 <b>Active:</b> <code>{len(active_results):,}</code>\n"
+                f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
+                f"└ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>Turbo multi-thread engine active...</i>"
+            )
+            if update_text != last_rendered and progress_mid:
+                try:
+                    tg("editMessageText", {"chat_id": chat, "message_id": progress_mid, "text": update_text, "parse_mode": "HTML"}, timeout=6)
+                    last_rendered = update_text
+                except Exception as exc:
+                    LOG.debug("Live progress update skipped: %s", exc)
 
     try:
         initial_bar = "░" * 16
@@ -1406,8 +1467,12 @@ def process_firebase_view(message):
         if progress_message and isinstance(progress_message, dict):
             progress_mid = progress_message.get("message_id")
 
-        # Turbo Multi-Threading: up to 120 parallel workers for lightning scans
-        max_workers = min(120, max(10, total))
+        # Start non-blocking background progress reporter
+        updater_thread = threading.Thread(target=progress_worker, daemon=True, name="fb-progress-updater")
+        updater_thread.start()
+
+        # Optimal worker sizing: 80 threads keeps RAM < 120MB (well below 400-450MB limit)
+        max_workers = min(80, max(10, total))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="viewer-check") as pool:
             futures = {pool.submit(check_viewer_target, target): target for target in targets}
             for future in as_completed(futures):
@@ -1423,57 +1488,13 @@ def process_firebase_view(message):
                 elif category == "protected":
                     protected_results.append(record)
                 else:
-                    inactive_results.append(record)
+                    inactive_count += 1
 
                 checked_count += 1
 
-                now_time = time.time()
-                # Throttled live update (1.5s) to guarantee zero Telegram rate-limit drops
-                if progress_mid and (now_time - last_edit_time >= 1.5 or checked_count == total):
-                    elapsed = max(0.1, now_time - start_time)
-                    percent = (checked_count / total) * 100.0
-                    bar_width = 16
-                    filled = int(round(bar_width * percent / 100.0))
-                    filled = min(bar_width, max(0, filled))
-                    empty = bar_width - filled
-                    bar = "█" * filled + "░" * empty
-
-                    rate = checked_count / elapsed if elapsed > 0 else 0
-                    if rate > 0 and checked_count < total:
-                        rem_sec = int((total - checked_count) / rate)
-                        m, s = divmod(rem_sec, 60)
-                        h, m = divmod(m, 60)
-                        est_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
-                    elif checked_count >= total:
-                        est_str = "00:00"
-                    else:
-                        est_str = "Calculating..."
-
-                    el_m, el_s = divmod(int(elapsed), 60)
-                    el_h, el_m = divmod(el_m, 60)
-                    elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}" if el_h > 0 else f"{el_m:02d}:{el_s:02d}"
-
-                    update_text = (
-                        f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"<code>[{bar}] {percent:.1f}%</code>\n\n"
-                        f"🚀 <b>Scan Speed:</b> <code>{int(rate)} URLs/sec</code>\n"
-                        f"⏳ <b>ETA Left:</b> <code>{est_str}</code> | ⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
-                        f"📊 <b>Live Progress:</b>\n"
-                        f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
-                        f"├ ⚡ <b>Checked:</b> <code>{checked_count:,}</code>\n"
-                        f"├ ⏳ <b>Pending:</b> <code>{total - checked_count:,}</code>\n"
-                        f"├ 🟢 <b>Active:</b> <code>{len(active_results):,}</code>\n"
-                        f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
-                        f"└ 🔴 <b>Dead / Deactive:</b> <code>{len(inactive_results):,}</code>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"<i>Turbo multi-thread engine active...</i>"
-                    )
-                    try:
-                        edit(chat, progress_mid, update_text)
-                        last_edit_time = now_time
-                    except Exception:
-                        pass
+        # Stop updater and finalize
+        stop_progress.set()
+        updater_thread.join(timeout=1.0)
 
         total_elapsed = max(0.1, time.time() - start_time)
         tot_m, tot_s = divmod(int(total_elapsed), 60)
@@ -1490,7 +1511,7 @@ def process_firebase_view(message):
             f"├ 📋 <b>Total Checked:</b> <code>{total:,}</code>\n"
             f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
             f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
-            f"├ 🔴 <b>Dead / Deactive:</b> <code>{len(inactive_results):,}</code>\n"
+            f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
             f"├ ⏱️ <b>Total Time:</b> <code>{tot_elapsed_str}</code>\n"
             f"├ 🚀 <b>Average Speed:</b> <code>{int(avg_rate)} URLs/sec</code>\n"
             f"└ 💎 <b>Diamonds Used:</b> <code>{format_diamonds(cost)}</code>\n"
@@ -1519,11 +1540,13 @@ def process_firebase_view(message):
                 send_protected_firebase_txt(chat, protected_urls)
 
     except Exception as exc:
+        stop_progress.set()
         LOG.exception("Viewer scanning error")
         if cost > 0:
             update_balance(uid, cost)
         send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>\n🔄 💎 <b>{format_diamonds(cost)} Diamond Refunded</b>.")
     finally:
+        stop_progress.set()
         session(uid)
         if viewer_slot_acquired:
             VIEWER_SLOTS.release()
