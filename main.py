@@ -6,15 +6,20 @@
 """
 
 import base64
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
+import hashlib
 import html
+import io
 import json
 import logging
 import os
 import random
 import re
 import secrets
+import socket
+socket.setdefaulttimeout(2.5)
 import sys
 import tempfile
 import threading
@@ -101,6 +106,9 @@ VIEWER_SLOTS = threading.BoundedSemaphore(12)
 LIMIT_LOCK = threading.Lock()
 active_extraction_users = set()
 active_viewer_users = set()
+active_dedup_users = set()
+active_scan_cancellations = {}
+scan_cancel_lock = threading.Lock()
 user_update_locks = {}
 MAX_DAILY_APKS = 100
 last_poll_at = time.monotonic()
@@ -297,19 +305,22 @@ def edit(chat, message_id, text, markup=None):
         return send(chat, text, markup)
 
 def answer(query, text="", alert=False):
+    if query.get("_answered"):
+        return
+    query["_answered"] = True
     payload = {"callback_query_id": query["id"]}
     if text:
         payload["text"] = text[:190]
         if alert:
             payload["show_alert"] = True
     try:
-        tg("answerCallbackQuery", payload, timeout=5)
+        tg("answerCallbackQuery", payload, timeout=3)
     except Exception:
         pass
 
 def is_process_running(uid):
     with LIMIT_LOCK:
-        return (uid in active_viewer_users) or (uid in active_extraction_users)
+        return (uid in active_viewer_users) or (uid in active_extraction_users) or (uid in active_dedup_users)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE INITIALIZATION
@@ -515,10 +526,13 @@ def require_membership(chat, uid, message_id=None):
 # USER INTERFACE & MENUS
 # ═══════════════════════════════════════════════════════════════
 def main_menu(uid):
-    rows = [[btn("📤 Extract", "menu:extract", "success"), btn("📊 Viewer 💎0.5", "menu:viewer", "primary")],
-            [btn("👤 Profile", "menu:profile", "success"), btn("🎁 Refer & Earn", "menu:refer", "success")],
-            [btn("🏆 Leaderboard", "menu:leaderboard", "primary"), btn("💎 Buy Diamonds", "menu:buy", "success")],
-        [btn("🧾 History", "menu:history", "primary"), btn("💬 Support", "menu:support", "primary")]]
+    rows = [
+        [btn("📤 Extract", "menu:extract", "success"), btn("📊 Viewer 💎0.5", "menu:viewer", "primary")],
+        [btn("🧹 Remove Duplicates (.txt) 💎1", "menu:dedup", "success")],
+        [btn("👤 Profile", "menu:profile", "success"), btn("🎁 Refer & Earn", "menu:refer", "success")],
+        [btn("🏆 Leaderboard", "menu:leaderboard", "primary"), btn("💎 Buy Diamonds", "menu:buy", "success")],
+        [btn("🧾 History", "menu:history", "primary"), btn("💬 Support", "menu:support", "primary")]
+    ]
     if is_admin(uid): rows.append([btn("🛠️ Admin", "admin:panel", "danger")])
     return kb(rows)
 
@@ -1273,35 +1287,25 @@ def read_firebase_status(url):
     # 1. Ultra-fast root probe with shallow=true (detects active/protected/dead in 1 call)
     try:
         req = Request(root_url + "/.json?shallow=true", headers=headers)
-        with urlopen(req, timeout=1.2) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        with urlopen(req, timeout=1.5) as response:
+            raw = response.read(8192).decode("utf-8", errors="ignore")
+            data = json.loads(raw) if raw else None
         
-        if data is not None and isinstance(data, dict):
-            # Check if this database has common device/client tables
-            for sub in ("clients", "All_User", "devices", "users"):
-                if sub in data:
-                    try:
-                        sub_req = Request(f"{root_url}/{sub}.json", headers=headers)
-                        with urlopen(sub_req, timeout=1.2) as sub_resp:
-                            sub_data = json.loads(sub_resp.read().decode("utf-8"))
-                            if isinstance(sub_data, dict):
-                                summary = firebase_status_summary(sub_data)
-                                if summary[0] > 0:
-                                    return summary
-                    except Exception:
-                        pass
-            return 0, 0, 0, 0
-        return 0, 0, 0, 0
+        if data is not None:
+            device_count = len(data) if isinstance(data, dict) else 0
+            return (root_url, device_count, 0, 0, 0)
+        return (root_url, 0, 0, 0, 0)
 
     except HTTPError as exc:
         if exc.code in {401, 403}:
-            # Root is protected by auth rules, verify /clients.json once
+            # Root is protected by auth rules, verify /clients.json?shallow=true once
             try:
-                c_req = Request(root_url + "/clients.json", headers=headers)
+                c_req = Request(root_url + "/clients.json?shallow=true", headers=headers)
                 with urlopen(c_req, timeout=1.2) as c_resp:
-                    c_data = json.loads(c_resp.read().decode("utf-8"))
-                    if isinstance(c_data, dict):
-                        return firebase_status_summary(c_data)
+                    c_raw = c_resp.read(8192).decode("utf-8", errors="ignore")
+                    c_data = json.loads(c_raw) if c_raw else None
+                if c_data is not None:
+                    return (root_url, len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
             except HTTPError as c_exc:
                 if c_exc.code in {401, 403}:
                     return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
@@ -1340,8 +1344,11 @@ def check_viewer_target(target):
 def process_firebase_view(message):
     uid, chat = message["from"]["id"], message["chat"]["id"]
     LOG.info("Firebase Viewer request from user %s", uid)
-    targets = firebase_targets_from_text(message.get("text", ""))
-    targets = list(dict.fromkeys(targets))
+    raw_targets = firebase_targets_from_text(message.get("text", ""))
+    total_raw = len(raw_targets)
+    targets = list(dict.fromkeys(raw_targets))
+    dup_count = total_raw - len(targets)
+
     if not targets:
         send(chat, "⚠️ Please send one or more valid Firebase URLs or a .txt file containing them.")
         return
@@ -1384,8 +1391,10 @@ def process_firebase_view(message):
         with LIMIT_LOCK:
             active_viewer_users.discard(uid)
         return
-    if cost > 0:
-        update_balance(uid, -cost)
+
+    cancel_event = threading.Event()
+    with scan_cancel_lock:
+        active_scan_cancellations[uid] = cancel_event
 
     progress_mid = None
     start_time = time.time()
@@ -1400,7 +1409,6 @@ def process_firebase_view(message):
 
     def progress_worker():
         last_rendered = ""
-        # Quick 0.6s initial tick so user sees progress immediately
         stop_progress.wait(0.6)
         while not stop_progress.is_set():
             curr_checked = checked_count
@@ -1429,6 +1437,7 @@ def process_firebase_view(message):
             elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}" if el_h > 0 else f"{el_m:02d}:{el_s:02d}"
             speed_display = f"{int(rate)} URLs/sec" if rate >= 1 else f"{rate:.1f} URLs/sec"
 
+            dup_info = f" <i>({dup_count:,} dup cleaned)</i>" if dup_count > 0 else ""
             update_text = (
                 f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1436,7 +1445,7 @@ def process_firebase_view(message):
                 f"🚀 <b>Scan Speed:</b> <code>{speed_display}</code>\n"
                 f"⏳ <b>ETA Left:</b> <code>{est_str}</code> | ⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
                 f"📊 <b>Live Progress:</b>\n"
-                f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
+                f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>{dup_info}\n"
                 f"├ ⚡ <b>Checked:</b> <code>{curr_checked:,}</code>\n"
                 f"├ ⏳ <b>Pending:</b> <code>{total - curr_checked:,}</code>\n"
                 f"├ 🟢 <b>Active:</b> <code>{len(active_results):,}</code>\n"
@@ -1447,7 +1456,13 @@ def process_firebase_view(message):
             )
             if update_text != last_rendered and progress_mid:
                 try:
-                    tg("editMessageText", {"chat_id": chat, "message_id": progress_mid, "text": update_text, "parse_mode": "HTML"}, timeout=5)
+                    tg("editMessageText", {
+                        "chat_id": chat,
+                        "message_id": progress_mid,
+                        "text": update_text,
+                        "parse_mode": "HTML",
+                        "reply_markup": kb([[btn("🛑 Stop Scan", f"scan:stop:{uid}", "danger")]])
+                    }, timeout=5)
                     last_rendered = update_text
                 except Exception as exc:
                     LOG.debug("Live progress update skipped: %s", exc)
@@ -1456,6 +1471,7 @@ def process_firebase_view(message):
 
     try:
         initial_bar = "░" * 16
+        dup_info = f" <i>({dup_count:,} duplicates removed)</i>" if dup_count > 0 else ""
         initial_text = (
             f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1463,7 +1479,7 @@ def process_firebase_view(message):
             f"🚀 <b>Scan Speed:</b> <code>Initializing...</code>\n"
             f"⏳ <b>ETA Left:</b> <code>00:00</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
             f"📊 <b>Live Progress:</b>\n"
-            f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
+            f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>{dup_info}\n"
             f"├ ⚡ <b>Checked:</b> <code>0</code>\n"
             f"├ ⏳ <b>Pending:</b> <code>{total:,}</code>\n"
             f"├ 🟢 <b>Active:</b> <code>0</code>\n"
@@ -1472,7 +1488,7 @@ def process_firebase_view(message):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>Turbo multi-thread engine active...</i>"
         )
-        progress_message = send(chat, initial_text)
+        progress_message = send(chat, initial_text, markup=kb([[btn("🛑 Stop Scan", f"scan:stop:{uid}", "danger")]]))
         if progress_message and isinstance(progress_message, dict):
             progress_mid = progress_message.get("message_id")
 
@@ -1484,22 +1500,33 @@ def process_firebase_view(message):
         max_workers = min(80, max(10, total))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="viewer-check") as pool:
             futures = {pool.submit(check_viewer_target, target): target for target in targets}
-            for future in as_completed(futures):
-                target = futures[future]
-                try:
-                    category, record = future.result()
-                except Exception as exc:
-                    category, record = "inactive", (target, str(exc)[:250])
+            pending_futures = set(futures.keys())
 
-                if category == "active":
-                    successful += 1
-                    active_results.append(record)
-                elif category == "protected":
-                    protected_results.append(record)
-                else:
-                    inactive_count += 1
+            while pending_futures:
+                if cancel_event.is_set():
+                    LOG.info("Scan cancelled by user %s", uid)
+                    for f in pending_futures:
+                        f.cancel()
+                    break
+                done, pending_futures = concurrent.futures.wait(
+                    pending_futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    target = futures[future]
+                    try:
+                        category, record = future.result()
+                    except Exception as exc:
+                        category, record = "inactive", (target, str(exc)[:250])
 
-                checked_count += 1
+                    if category == "active":
+                        successful += 1
+                        active_results.append(record)
+                    elif category == "protected":
+                        protected_results.append(record)
+                    else:
+                        inactive_count += 1
+
+                    checked_count += 1
 
         # Stop updater and finalize
         stop_progress.set()
@@ -1509,8 +1536,36 @@ def process_firebase_view(message):
         tot_m, tot_s = divmod(int(total_elapsed), 60)
         tot_h, tot_m = divmod(tot_m, 60)
         tot_elapsed_str = f"{tot_h:02d}:{tot_m:02d}:{tot_s:02d}" if tot_h > 0 else f"{tot_m:02d}:{tot_s:02d}"
-        avg_rate = checked_count / total_elapsed if total_elapsed > 0 else 0
 
+        if cancel_event.is_set():
+            stopped_msg = (
+                f"🛑 <b>SCAN STOPPED BY USER!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>Partial Progress Summary:</b>\n"
+                f"├ 📋 <b>Total Checked:</b> <code>{checked_count:,} / {total:,}</code>\n"
+                + (f"├ 🧹 <b>Duplicates Filtered:</b> <code>{dup_count:,}</code>\n" if dup_count > 0 else "")
+                + f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
+                f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
+                f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
+                f"├ ⏱️ <b>Time Elapsed:</b> <code>{tot_elapsed_str}</code>\n"
+                f"└ 💎 <b>Diamonds Deducted:</b> <code>0 (Cancelled)</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"ℹ️ <i>Scan was stopped early. No diamonds were deducted.</i>"
+            )
+            if progress_mid:
+                try:
+                    edit(chat, progress_mid, stopped_msg)
+                except Exception:
+                    send(chat, stopped_msg)
+            else:
+                send(chat, stopped_msg)
+
+            if active_results:
+                active_urls = list(dict.fromkeys(record[0] for record in active_results))
+                send_active_firebase_txt(chat, active_urls)
+            return
+
+        avg_rate = checked_count / total_elapsed if total_elapsed > 0 else 0
         bar_complete = "█" * 16
         summary_msg = (
             f"✅ <b>FIREBASE SCANNING COMPLETED!</b>\n"
@@ -1518,7 +1573,8 @@ def process_firebase_view(message):
             f"<code>[{bar_complete}] 100.0%</code>\n\n"
             f"📊 <b>Final Performance Summary:</b>\n"
             f"├ 📋 <b>Total Checked:</b> <code>{total:,}</code>\n"
-            f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
+            + (f"├ 🧹 <b>Duplicates Filtered:</b> <code>{dup_count:,}</code>\n" if dup_count > 0 else "")
+            + f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
             f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
             f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
             f"├ ⏱️ <b>Total Time:</b> <code>{tot_elapsed_str}</code>\n"
@@ -1548,21 +1604,264 @@ def process_firebase_view(message):
             if protected_urls:
                 send_protected_firebase_txt(chat, protected_urls)
 
+        # Deduct diamond only upon successful completion
+        if cost > 0:
+            update_balance(uid, -cost)
+
     except Exception as exc:
         stop_progress.set()
         LOG.exception("Viewer scanning error")
-        if cost > 0:
-            update_balance(uid, cost)
-        send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>\n🔄 💎 <b>{format_diamonds(cost)} Diamond Refunded</b>.")
+        send(chat, f"❌ <b>Viewer Error:</b> <code>{esc(str(exc)[:250])}</code>\nℹ️ <i>No diamonds were deducted.</i>")
     finally:
         stop_progress.set()
         session(uid)
+        with scan_cancel_lock:
+            active_scan_cancellations.pop(uid, None)
         if viewer_slot_acquired:
             VIEWER_SLOTS.release()
         if viewer_claimed:
             with LIMIT_LOCK:
                 active_viewer_users.discard(uid)
         gc.collect()
+    another_task_prompt(chat)
+
+# ═══════════════════════════════════════════════════════════════
+# DEDUPLICATION TOOL ENGINE
+# ═══════════════════════════════════════════════════════════════
+def process_dedup_file(message):
+    uid, chat = message["from"]["id"], message["chat"]["id"]
+    file_path_str = message.get("downloaded_path")
+    original_name = message.get("doc_name") or "data.txt"
+    base_name = original_name.rsplit(".", 1)[0] if "." in original_name else original_name
+    out_name = f"Cleaned_{base_name}.txt"
+    path = Path(file_path_str) if file_path_str else None
+
+    is_adm = is_admin(uid)
+    cost = 0 if is_adm else 1.0
+    user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
+    user = user or {}
+    if not is_adm and user.get("diamonds", 0) < cost:
+        send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 1 Diamond to use Deduplication Tool.")
+        session(uid)
+        if path and path.exists():
+            path.unlink(missing_ok=True)
+        return
+
+    with LIMIT_LOCK:
+        if uid in active_dedup_users:
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            if path and path.exists():
+                path.unlink(missing_ok=True)
+            return
+        active_dedup_users.add(uid)
+
+    cancel_event = threading.Event()
+    with scan_cancel_lock:
+        active_scan_cancellations[uid] = cancel_event
+
+    progress_mid = None
+    clean_path = None
+    start_time = time.time()
+    try:
+        initial_msg = (
+            f"🧹 <b>DEDUPLICATION ENGINE 1.0</b> ⚡\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<code>[░░░░░░░░░░░░░░░░] 0.0%</code>\n\n"
+            f"🚀 <b>Speed:</b> <code>Reading lines...</code>\n"
+            f"⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
+            f"📊 <b>Cleaning Progress:</b>\n"
+            f"├ 📋 <b>Lines Read:</b> <code>0</code>\n"
+            f"├ 🟢 <b>Unique Kept:</b> <code>0</code>\n"
+            f"└ 🗑️ <b>Duplicates Removed:</b> <code>0</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>High-speed line deduplication in progress...</i>"
+        )
+        prog = send(chat, initial_msg, markup=kb([[btn("🛑 Stop Clean", f"scan:stop:{uid}", "danger")]]))
+        if prog and isinstance(prog, dict):
+            progress_mid = prog.get("message_id")
+
+        clean_path = path.with_name(f"clean_{path.name}")
+        seen_hashes = set()
+        total_lines = 0
+        unique_lines = 0
+        dup_lines = 0
+        last_edit_time = time.time()
+
+        with io.open(path, "r", encoding="utf-8", errors="ignore") as infile, \
+             io.open(clean_path, "w", encoding="utf-8", newline="\n") as outfile:
+            for line in infile:
+                if cancel_event.is_set():
+                    break
+                total_lines += 1
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                line_key = stripped.lower() if len(stripped) < 100 else hashlib.md5(stripped.lower().encode("utf-8")).digest()
+                if line_key in seen_hashes:
+                    dup_lines += 1
+                else:
+                    seen_hashes.add(line_key)
+                    unique_lines += 1
+                    outfile.write(stripped + "\n")
+
+                now = time.time()
+                if now - last_edit_time >= 2.0:
+                    last_edit_time = now
+                    elapsed = max(0.1, now - start_time)
+                    rate = total_lines / elapsed
+                    el_m, el_s = divmod(int(elapsed), 60)
+                    elapsed_str = f"{el_m:02d}:{el_s:02d}"
+                    progress_text = (
+                        f"🧹 <b>DEDUPLICATION ENGINE 1.0</b> ⚡\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🚀 <b>Speed:</b> <code>{int(rate):,} lines/sec</code>\n"
+                        f"⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
+                        f"📊 <b>Cleaning Progress:</b>\n"
+                        f"├ 📋 <b>Lines Read:</b> <code>{total_lines:,}</code>\n"
+                        f"├ 🟢 <b>Unique Kept:</b> <code>{unique_lines:,}</code>\n"
+                        f"└ 🗑️ <b>Duplicates Removed:</b> <code>{dup_lines:,}</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<i>High-speed line deduplication in progress...</i>"
+                    )
+                    if progress_mid:
+                        try:
+                            edit(chat, progress_mid, progress_text, markup=kb([[btn("🛑 Stop Clean", f"scan:stop:{uid}", "danger")]]))
+                        except Exception:
+                            pass
+
+        if cancel_event.is_set():
+            cancel_msg = (
+                f"🛑 <b>Deduplication Cancelled by User!</b>\n\n"
+                f"Processed {total_lines:,} lines before stopping.\n"
+                f"ℹ️ <i>No diamonds were deducted.</i>"
+            )
+            if progress_mid:
+                try:
+                    edit(chat, progress_mid, cancel_msg)
+                except Exception:
+                    send(chat, cancel_msg)
+            else:
+                send(chat, cancel_msg)
+            return
+
+        total_elapsed = max(0.01, time.time() - start_time)
+        caption = (
+            f"✅ <b>FILE CLEANED SUCCESSFULLY!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Deduplication Summary:</b>\n"
+            f"├ 📋 <b>Total Lines:</b> <code>{total_lines:,}</code>\n"
+            f"├ 🟢 <b>Unique Kept:</b> <code>{unique_lines:,}</code>\n"
+            f"├ 🗑️ <b>Duplicates Removed:</b> <code>{dup_lines:,}</code>\n"
+            f"├ ⏱️ <b>Time Taken:</b> <code>{total_elapsed:.2f}s</code>\n"
+            f"└ 💎 <b>Diamonds Deducted:</b> <code>{format_diamonds(cost)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 <i>Clean file is attached without duplicates.</i>"
+        )
+
+        send_document(chat, clean_path, caption=caption)
+
+        if progress_mid:
+            try:
+                delete_message(chat, progress_mid)
+            except Exception:
+                pass
+
+        if cost > 0:
+            update_balance(uid, -cost)
+
+    except Exception as exc:
+        LOG.exception("Deduplication error")
+        send(chat, f"❌ <b>Deduplication Error:</b> <code>{esc(str(exc)[:250])}</code>\nℹ️ <i>No diamonds were deducted.</i>")
+    finally:
+        session(uid)
+        with LIMIT_LOCK:
+            active_dedup_users.discard(uid)
+        with scan_cancel_lock:
+            active_scan_cancellations.pop(uid, None)
+        if path and path.exists():
+            path.unlink(missing_ok=True)
+        if clean_path and clean_path.exists():
+            clean_path.unlink(missing_ok=True)
+        gc.collect()
+    another_task_prompt(chat)
+
+def process_dedup_text(message):
+    uid, chat = message["from"]["id"], message["chat"]["id"]
+    text = message.get("text", "")
+    if not text.strip():
+        send(chat, "⚠️ Please send valid text or upload a .txt file.")
+        return
+
+    is_adm = is_admin(uid)
+    cost = 0 if is_adm else 1.0
+    user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
+    user = user or {}
+    if not is_adm and user.get("diamonds", 0) < cost:
+        send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 1 Diamond to use Deduplication Tool.")
+        session(uid)
+        return
+
+    with LIMIT_LOCK:
+        if uid in active_dedup_users:
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
+        active_dedup_users.add(uid)
+
+    start_time = time.time()
+    try:
+        lines = text.splitlines()
+        total_lines = len(lines)
+        seen_hashes = set()
+        clean_lines = []
+        dup_lines = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            line_key = stripped.lower()
+            if line_key in seen_hashes:
+                dup_lines += 1
+            else:
+                seen_hashes.add(line_key)
+                clean_lines.append(stripped)
+
+        unique_lines = len(clean_lines)
+        total_elapsed = max(0.01, time.time() - start_time)
+
+        caption = (
+            f"✅ <b>TEXT CLEANED SUCCESSFULLY!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Deduplication Summary:</b>\n"
+            f"├ 📋 <b>Total Lines:</b> <code>{total_lines:,}</code>\n"
+            f"├ 🟢 <b>Unique Kept:</b> <code>{unique_lines:,}</code>\n"
+            f"├ 🗑️ <b>Duplicates Removed:</b> <code>{dup_lines:,}</code>\n"
+            f"├ ⏱️ <b>Time Taken:</b> <code>{total_elapsed:.2f}s</code>\n"
+            f"└ 💎 <b>Diamonds Deducted:</b> <code>{format_diamonds(cost)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 <i>Clean file is attached without duplicates.</i>"
+        )
+
+        temp_dir = tempfile.gettempdir()
+        temp_file = Path(temp_dir) / f"Cleaned_Text_{int(time.time())}.txt"
+        temp_file.write_text("\n".join(clean_lines), encoding="utf-8")
+        try:
+            send_document(chat, temp_file, caption=caption)
+        finally:
+            temp_file.unlink(missing_ok=True)
+
+        if cost > 0:
+            update_balance(uid, -cost)
+
+    except Exception as exc:
+        LOG.exception("Deduplication text error")
+        send(chat, f"❌ <b>Deduplication Error:</b> <code>{esc(str(exc)[:250])}</code>\nℹ️ <i>No diamonds were deducted.</i>")
+    finally:
+        session(uid)
+        with LIMIT_LOCK:
+            active_dedup_users.discard(uid)
+        gc.collect()
+    another_task_prompt(chat)
     another_task_prompt(chat)
 
 # ═══════════════════════════════════════════════════════════════
@@ -2009,11 +2308,22 @@ def callback(q):
     if not is_private_chat(msg):
         answer(q, "Please use the bot in private chat.")
         return
-    answer(q)
-    time.sleep(CALLBACK_REPLY_DELAY_SECONDS)
     data = q.get("data", "").split(":"); action, value = data[0], data[1] if len(data) > 1 else ""
     uid = q["from"]["id"]; chat = msg.get("chat", {}).get("id", uid); mid = msg.get("message_id")
     try:
+        if action == "scan" and value == "stop":
+            target_uid = int(data[2]) if len(data) > 2 else uid
+            if target_uid != uid and not is_admin(uid):
+                answer(q, "⚠️ You cannot stop someone else's scan.", alert=True)
+                return
+            with scan_cancel_lock:
+                evt = active_scan_cancellations.get(target_uid)
+            if evt and not evt.is_set():
+                evt.set()
+                answer(q, "🛑 Stopping process...", alert=False)
+            else:
+                answer(q, "ℹ️ Process is already stopped or finished.", alert=False)
+            return
         if action == "sub" and value == "verify":
             unjoined = unjoined_channels(uid)
             if not unjoined:
@@ -2078,6 +2388,20 @@ def callback(q):
                     return
                 session(uid, {"action": "firebase_view"})
                 edit(chat, mid, "📊 <b>Firebase Viewer</b>\n\nSend one or more Firebase Realtime Database URLs, a Base64-wrapped URL, or a .txt file.\n\n💎 Cost: <b>0.5 Diamond</b>", kb([[btn("❌ Cancel", "nav:home")]]))
+            elif value == "dedup":
+                if is_process_running(uid):
+                    answer(q, "⚠️ A process is currently running. Please let it finish first.", alert=True)
+                    return
+                session(uid, {"action": "dedup"})
+                edit(
+                    chat,
+                    mid,
+                    "🧹 <b>Remove Duplicates (.txt Cleaner)</b>\n\n"
+                    "Apni koi bhi <b>.txt</b> file bhejein ya direct text lines bhejein.\n"
+                    "Bot usme se saare duplicate lines remove karke ek clean unique <b>.txt</b> file bana kar dega!\n\n"
+                    "💎 Cost: <b>1 Diamond</b> (Chahe kitni bhi badi file ho)",
+                    kb([[btn("❌ Cancel", "nav:home")]])
+                )
             elif value == "profile":
                 u = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
                 u = u or {}
@@ -2196,7 +2520,10 @@ def callback(q):
                 fallback_channels[:] = [x for x in fallback_channels if x.get("chat_id") != int(data[2])]
             admin_channels(chat,mid)
         elif action == "image" and is_admin(uid): session(uid,{"action":"image","key":value}); edit(chat,mid,"📷 Send the image photo now.",kb([[btn("🔙 Back","admin:images")]]))
-    except Exception: LOG.exception("callback failed: %s", q.get("data"))
+    except Exception:
+        LOG.exception("callback failed: %s", q.get("data"))
+    finally:
+        answer(q)
 
 # ═══════════════════════════════════════════════════════════════
 # MESSAGE HANDLER
@@ -2240,6 +2567,16 @@ def handle_message(msg_obj):
             path = None
             try:
                 path = download(doc["file_id"])
+                if state_action == "dedup":
+                    if is_process_running(uid):
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        return
+                    submit_work(
+                        process_dedup_file,
+                        {**msg_obj, "downloaded_path": str(path), "doc_name": doc.get("file_name", "data.txt")},
+                    )
+                    path = None
+                    return
                 text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
                 targets = firebase_targets_from_text(text_content)
                 if targets or state_action == "firebase_view":
@@ -2286,6 +2623,13 @@ def handle_message(msg_obj):
             send(chat, "⚠️ Please send a valid Firebase Realtime Database URL.")
             return
         submit_work(process_firebase_view, msg_obj)
+        return
+
+    if state_action == "dedup":
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
+        submit_work(process_dedup_text, msg_obj)
         return
 
     # Auto-detection: If user directly sends Firebase URL(s) without menu, check them immediately
