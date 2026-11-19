@@ -296,9 +296,20 @@ def edit(chat, message_id, text, markup=None):
             delete_message(chat, message_id)
         return send(chat, text, markup)
 
-def answer(query, text=""):
-    try: tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": text[:190]})
-    except Exception: pass
+def answer(query, text="", alert=False):
+    payload = {"callback_query_id": query["id"]}
+    if text:
+        payload["text"] = text[:190]
+        if alert:
+            payload["show_alert"] = True
+    try:
+        tg("answerCallbackQuery", payload, timeout=5)
+    except Exception:
+        pass
+
+def is_process_running(uid):
+    with LIMIT_LOCK:
+        return (uid in active_viewer_users) or (uid in active_extraction_users)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE INITIALIZATION
@@ -1353,7 +1364,7 @@ def process_firebase_view(message):
             active_viewer_users.add(uid)
             viewer_claimed = True
     if viewer_already_active:
-        send(chat, "⏳ Aapki pichli Firebase scanning abhi chal rahi hai. Kripya thoda intezar karein.")
+        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
         return
     if not VIEWER_SLOTS.acquire(blocking=False):
         with LIMIT_LOCK:
@@ -1389,18 +1400,13 @@ def process_firebase_view(message):
 
     def progress_worker():
         last_rendered = ""
+        # Quick 0.6s initial tick so user sees progress immediately
+        stop_progress.wait(0.6)
         while not stop_progress.is_set():
-            stop_progress.wait(2.5)
-            if stop_progress.is_set():
-                break
-
             curr_checked = checked_count
-            if curr_checked == 0:
-                continue
-
             now_time = time.time()
             elapsed = max(0.1, now_time - start_time)
-            percent = (curr_checked / total) * 100.0
+            percent = (curr_checked / total) * 100.0 if total > 0 else 0
             bar_width = 16
             filled = int(round(bar_width * percent / 100.0))
             filled = min(bar_width, max(0, filled))
@@ -1416,17 +1422,18 @@ def process_firebase_view(message):
             elif curr_checked >= total:
                 est_str = "00:00"
             else:
-                est_str = "Calculating..."
+                est_str = "00:00"
 
             el_m, el_s = divmod(int(elapsed), 60)
             el_h, el_m = divmod(el_m, 60)
             elapsed_str = f"{el_h:02d}:{el_m:02d}:{el_s:02d}" if el_h > 0 else f"{el_m:02d}:{el_s:02d}"
+            speed_display = f"{int(rate)} URLs/sec" if rate >= 1 else f"{rate:.1f} URLs/sec"
 
             update_text = (
                 f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<code>[{bar}] {percent:.1f}%</code>\n\n"
-                f"🚀 <b>Scan Speed:</b> <code>{int(rate)} URLs/sec</code>\n"
+                f"🚀 <b>Scan Speed:</b> <code>{speed_display}</code>\n"
                 f"⏳ <b>ETA Left:</b> <code>{est_str}</code> | ⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n\n"
                 f"📊 <b>Live Progress:</b>\n"
                 f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
@@ -1440,10 +1447,12 @@ def process_firebase_view(message):
             )
             if update_text != last_rendered and progress_mid:
                 try:
-                    tg("editMessageText", {"chat_id": chat, "message_id": progress_mid, "text": update_text, "parse_mode": "HTML"}, timeout=6)
+                    tg("editMessageText", {"chat_id": chat, "message_id": progress_mid, "text": update_text, "parse_mode": "HTML"}, timeout=5)
                     last_rendered = update_text
                 except Exception as exc:
                     LOG.debug("Live progress update skipped: %s", exc)
+
+            stop_progress.wait(2.0)
 
     try:
         initial_bar = "░" * 16
@@ -1451,8 +1460,8 @@ def process_firebase_view(message):
             f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<code>[{initial_bar}] 0.0%</code>\n\n"
-            f"🚀 <b>Scan Speed:</b> <code>Starting...</code>\n"
-            f"⏳ <b>ETA Left:</b> <code>Calculating...</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
+            f"🚀 <b>Scan Speed:</b> <code>Initializing...</code>\n"
+            f"⏳ <b>ETA Left:</b> <code>00:00</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
             f"📊 <b>Live Progress:</b>\n"
             f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>\n"
             f"├ ⚡ <b>Checked:</b> <code>0</code>\n"
@@ -2048,6 +2057,9 @@ def callback(q):
             welcome(chat, uid, mid)
         elif action == "menu":
             if value == "extract":
+                if is_process_running(uid):
+                    answer(q, "⚠️ A process is currently running. Please let it finish first.", alert=True)
+                    return
                 prompt = edit(
                     chat,
                     mid,
@@ -2061,6 +2073,9 @@ def callback(q):
                 session(uid, {"action": "extract", "message_id": prompt_id, "started_at": started_at})
                 schedule_extract_timeout(chat, uid, prompt_id, started_at)
             elif value == "viewer":
+                if is_process_running(uid):
+                    answer(q, "⚠️ A process is currently running. Please let it finish first.", alert=True)
+                    return
                 session(uid, {"action": "firebase_view"})
                 edit(chat, mid, "📊 <b>Firebase Viewer</b>\n\nSend one or more Firebase Realtime Database URLs, a Base64-wrapped URL, or a .txt file.\n\n💎 Cost: <b>0.5 Diamond</b>", kb([[btn("❌ Cancel", "nav:home")]]))
             elif value == "profile":
@@ -2228,9 +2243,17 @@ def handle_message(msg_obj):
                 text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
                 targets = firebase_targets_from_text(text_content)
                 if targets or state_action == "firebase_view":
-                    return process_firebase_view({**msg_obj, "text": text_content})
+                    if is_process_running(uid):
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        return
+                    submit_work(process_firebase_view, {**msg_obj, "text": text_content})
+                    return
                 elif state_action == "extract":
-                    return process_extraction(msg_obj)
+                    if is_process_running(uid):
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        return
+                    submit_work(process_extraction, msg_obj)
+                    return
                 else:
                     send(chat, "⚠️ <b>File Check:</b> Is .txt file me koi valid Firebase URL nahi mila.\n\nKripya valid Firebase Realtime Database URLs wali <b>.txt</b> file bhejein.")
                     return
@@ -2246,20 +2269,32 @@ def handle_message(msg_obj):
     if is_admin(uid) and state and handle_admin_input(msg_obj, state, text): return
 
     if state_action == "extract":
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
         if not looks_like_url(text):
             send(chat, "⚠️ Please send an APK file or a valid public web/Firebase URL.")
             return
-        return process_extraction(msg_obj)
+        submit_work(process_extraction, msg_obj)
+        return
 
     if state_action == "firebase_view":
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
         if not firebase_targets_from_text(text):
             send(chat, "⚠️ Please send a valid Firebase Realtime Database URL.")
             return
-        return process_firebase_view(msg_obj)
+        submit_work(process_firebase_view, msg_obj)
+        return
 
     # Auto-detection: If user directly sends Firebase URL(s) without menu, check them immediately
     if firebase_targets_from_text(text):
-        return process_firebase_view(msg_obj)
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
+        submit_work(process_firebase_view, msg_obj)
+        return
 
     if state == "buy":
         if not text.isdigit() or not 1 <= int(text) <= 100000: return send(chat,"Send a valid number from 1 to 100000.")
@@ -2403,7 +2438,7 @@ def main():
             for update in updates:
                 offset = update["update_id"]
                 if update.get("callback_query"): 
-                    submit_user_work(callback, update["callback_query"])
+                    submit_work(callback, update["callback_query"])
                 elif update.get("message"):
                     message = update["message"]
                     if queue_media_group_message(message):
