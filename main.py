@@ -686,7 +686,7 @@ def normalize_firebase_url(raw):
         host = (p.hostname or "").lower()
         if p.scheme not in {"http", "https"} or not FIREBASE_REGEX.search(host):
             return ""
-        if host in {"firebaseio.com", "firebasedatabase.app", "firebaseapp.com"}:
+        if host in {"firebaseio.com", "firebasedatabase.app", "firebaseapp.com", "your-project.firebaseio.com", "your-project-default-rtdb.firebaseio.com"}:
             return ""
         # Keep only the canonical Firebase database root: host-only URL,
         # regardless of extra path, query, or garbage suffixes embedded in APK strings.
@@ -841,6 +841,25 @@ def scan_web(text_input):
             found.update(embedded)
             if embedded:
                 continue
+
+            # Auto-decode web panel share tokens (e.g. ZXKAI / ?s= parameter)
+            if "s=" in url:
+                parsed_u = urlparse(url)
+                qs = parse_qs(parsed_u.query)
+                if "s" in qs and qs["s"]:
+                    s_token = qs["s"][0]
+                    api_endpoint = urljoin(url, "/api/decode-share")
+                    try:
+                        req_data = json.dumps({"s": s_token}).encode("utf-8")
+                        req_share = Request(api_endpoint, data=req_data, headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]})
+                        with urlopen(req_share, timeout=5) as r_share:
+                            res_json = json.loads(r_share.read().decode("utf-8", errors="ignore"))
+                            if res_json.get("success") and res_json.get("url"):
+                                normalized = normalize_firebase_url(res_json["url"])
+                                if normalized:
+                                    found.add(normalized)
+                    except Exception:
+                        pass
             p = urlparse(url)
             if FIREBASE_REGEX.search(p.hostname or ""): 
                 found.update(endpoint_urls(url))
@@ -1293,8 +1312,8 @@ def read_firebase_status(url):
         
         if data is not None:
             device_count = len(data) if isinstance(data, dict) else 0
-            return (root_url, device_count, 0, 0, 0)
-        return (root_url, 0, 0, 0, 0)
+            return (device_count, 0, 0, 0)
+        return (0, 0, 0, 0)
 
     except HTTPError as exc:
         if exc.code in {401, 403}:
@@ -1305,7 +1324,7 @@ def read_firebase_status(url):
                     c_raw = c_resp.read(8192).decode("utf-8", errors="ignore")
                     c_data = json.loads(c_raw) if c_raw else None
                 if c_data is not None:
-                    return (root_url, len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
+                    return (len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
             except HTTPError as c_exc:
                 if c_exc.code in {401, 403}:
                     return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
@@ -1470,36 +1489,50 @@ def process_firebase_view(message):
             stop_progress.wait(2.0)
 
     try:
-        initial_bar = "░" * 16
-        dup_info = f" <i>({dup_count:,} duplicates removed)</i>" if dup_count > 0 else ""
-        initial_text = (
-            f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>[{initial_bar}] 0.0%</code>\n\n"
-            f"🚀 <b>Scan Speed:</b> <code>Initializing...</code>\n"
-            f"⏳ <b>ETA Left:</b> <code>00:00</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
-            f"📊 <b>Live Progress:</b>\n"
-            f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>{dup_info}\n"
-            f"├ ⚡ <b>Checked:</b> <code>0</code>\n"
-            f"├ ⏳ <b>Pending:</b> <code>{total:,}</code>\n"
-            f"├ 🟢 <b>Active:</b> <code>0</code>\n"
-            f"├ ⚠️ <b>Auth Protected:</b> <code>0</code>\n"
-            f"└ 🔴 <b>Dead / Deactive:</b> <code>0</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Turbo multi-thread engine active...</i>"
-        )
-        progress_message = send(chat, initial_text, markup=kb([[btn("🛑 Stop Scan", f"scan:stop:{uid}", "danger")]]))
-        if progress_message and isinstance(progress_message, dict):
-            progress_mid = progress_message.get("message_id")
+        updater_thread = None
+        if total > 10:
+            initial_bar = "░" * 16
+            dup_info = f" <i>({dup_count:,} duplicates removed)</i>" if dup_count > 0 else ""
+            initial_text = (
+                f"⚡ <b>FIREBASE SCANNER ENGINE 2.0</b> ⚡\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>[{initial_bar}] 0.0%</code>\n\n"
+                f"🚀 <b>Scan Speed:</b> <code>Initializing...</code>\n"
+                f"⏳ <b>ETA Left:</b> <code>00:00</code> | ⏱️ <b>Elapsed:</b> <code>00:00</code>\n\n"
+                f"📊 <b>Live Progress:</b>\n"
+                f"├ 🎯 <b>Total Links:</b> <code>{total:,}</code>{dup_info}\n"
+                f"├ ⚡ <b>Checked:</b> <code>0</code>\n"
+                f"├ ⏳ <b>Pending:</b> <code>{total:,}</code>\n"
+                f"├ 🟢 <b>Active:</b> <code>0</code>\n"
+                f"├ ⚠️ <b>Auth Protected:</b> <code>0</code>\n"
+                f"└ 🔴 <b>Dead / Deactive:</b> <code>0</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>Turbo multi-thread engine active...</i>"
+            )
+            progress_message = send(chat, initial_text, markup=kb([[btn("🛑 Stop Scan", f"scan:stop:{uid}", "danger")]]))
+            if progress_message and isinstance(progress_message, dict):
+                progress_mid = progress_message.get("message_id")
 
-        # Start non-blocking background progress reporter
-        updater_thread = threading.Thread(target=progress_worker, daemon=True, name="fb-progress-updater")
-        updater_thread.start()
+            # Start non-blocking background progress reporter for bulk scans (> 10)
+            updater_thread = threading.Thread(target=progress_worker, daemon=True, name="fb-progress-updater")
+            updater_thread.start()
+        else:
+            sticker = cfg().get("viewer_sticker", "")
+            if sticker:
+                try:
+                    progress_message = send_sticker(chat, sticker)
+                except Exception:
+                    progress_message = send(chat, f"🔎 <b>Checking {total} Firebase URL(s)...</b>")
+            else:
+                progress_message = send(chat, f"🔎 <b>Checking {total} Firebase URL(s)...</b>")
+            if progress_message and isinstance(progress_message, dict):
+                progress_mid = progress_message.get("message_id")
 
         # Optimal worker sizing: 80 threads keeps RAM < 120MB (well below 400-450MB limit)
+        ordered_results = {} if total <= 10 else None
         max_workers = min(80, max(10, total))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="viewer-check") as pool:
-            futures = {pool.submit(check_viewer_target, target): target for target in targets}
+            futures = {pool.submit(check_viewer_target, target): (idx, target) for idx, target in enumerate(targets)}
             pending_futures = set(futures.keys())
 
             while pending_futures:
@@ -1512,7 +1545,7 @@ def process_firebase_view(message):
                     pending_futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 for future in done:
-                    target = futures[future]
+                    idx, target = futures[future]
                     try:
                         category, record = future.result()
                     except Exception as exc:
@@ -1526,11 +1559,15 @@ def process_firebase_view(message):
                     else:
                         inactive_count += 1
 
+                    if ordered_results is not None:
+                        ordered_results[idx] = (category, record)
+
                     checked_count += 1
 
         # Stop updater and finalize
         stop_progress.set()
-        updater_thread.join(timeout=1.0)
+        if updater_thread:
+            updater_thread.join(timeout=1.0)
 
         total_elapsed = max(0.1, time.time() - start_time)
         tot_m, tot_s = divmod(int(total_elapsed), 60)
@@ -1538,71 +1575,128 @@ def process_firebase_view(message):
         tot_elapsed_str = f"{tot_h:02d}:{tot_m:02d}:{tot_s:02d}" if tot_h > 0 else f"{tot_m:02d}:{tot_s:02d}"
 
         if cancel_event.is_set():
-            stopped_msg = (
-                f"🛑 <b>SCAN STOPPED BY USER!</b>\n"
+            if total > 10:
+                stopped_msg = (
+                    f"🛑 <b>SCAN STOPPED BY USER!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 <b>Partial Progress Summary:</b>\n"
+                    f"├ 📋 <b>Total Checked:</b> <code>{checked_count:,} / {total:,}</code>\n"
+                    + (f"├ 🧹 <b>Duplicates Filtered:</b> <code>{dup_count:,}</code>\n" if dup_count > 0 else "")
+                    + f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
+                    f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
+                    f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
+                    f"├ ⏱️ <b>Time Elapsed:</b> <code>{tot_elapsed_str}</code>\n"
+                    f"└ 💎 <b>Diamonds Deducted:</b> <code>0 (Cancelled)</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"ℹ️ <i>Scan was stopped early. No diamonds were deducted.</i>"
+                )
+                if progress_mid:
+                    try:
+                        edit(chat, progress_mid, stopped_msg)
+                    except Exception:
+                        send(chat, stopped_msg)
+                else:
+                    send(chat, stopped_msg)
+
+                if active_results:
+                    active_urls = list(dict.fromkeys(record[0] for record in active_results))
+                    send_active_firebase_txt(chat, active_urls)
+            else:
+                if progress_mid:
+                    try:
+                        delete_message(chat, progress_mid)
+                    except Exception:
+                        pass
+                send(chat, "🛑 <b>Scan stopped by user.</b> <i>No diamonds were deducted.</i>")
+            return
+
+        if total > 10:
+            avg_rate = checked_count / total_elapsed if total_elapsed > 0 else 0
+            bar_complete = "█" * 16
+            summary_msg = (
+                f"✅ <b>FIREBASE SCANNING COMPLETED!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 <b>Partial Progress Summary:</b>\n"
-                f"├ 📋 <b>Total Checked:</b> <code>{checked_count:,} / {total:,}</code>\n"
+                f"<code>[{bar_complete}] 100.0%</code>\n\n"
+                f"📊 <b>Final Performance Summary:</b>\n"
+                f"├ 📋 <b>Total Checked:</b> <code>{total:,}</code>\n"
                 + (f"├ 🧹 <b>Duplicates Filtered:</b> <code>{dup_count:,}</code>\n" if dup_count > 0 else "")
                 + f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
                 f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
                 f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
-                f"├ ⏱️ <b>Time Elapsed:</b> <code>{tot_elapsed_str}</code>\n"
-                f"└ 💎 <b>Diamonds Deducted:</b> <code>0 (Cancelled)</code>\n"
+                f"├ ⏱️ <b>Total Time:</b> <code>{tot_elapsed_str}</code>\n"
+                f"├ 🚀 <b>Average Speed:</b> <code>{int(avg_rate)} URLs/sec</code>\n"
+                f"└ 💎 <b>Diamonds Used:</b> <code>{format_diamonds(cost)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"ℹ️ <i>Scan was stopped early. No diamonds were deducted.</i>"
+                f"📁 <i>Active Firebase result file is delivered below.</i>"
             )
             if progress_mid:
                 try:
-                    edit(chat, progress_mid, stopped_msg)
+                    edit(chat, progress_mid, summary_msg)
                 except Exception:
-                    send(chat, stopped_msg)
+                    send(chat, summary_msg)
             else:
-                send(chat, stopped_msg)
+                send(chat, summary_msg)
 
+            # Deliver Active Firebase TXT file
             if active_results:
                 active_urls = list(dict.fromkeys(record[0] for record in active_results))
                 send_active_firebase_txt(chat, active_urls)
-            return
+            else:
+                send(chat, f"ℹ️ <b>Scan Complete:</b> Total {total:,} URLs me se koi bhi Active/Working Firebase nahi mila.")
 
-        avg_rate = checked_count / total_elapsed if total_elapsed > 0 else 0
-        bar_complete = "█" * 16
-        summary_msg = (
-            f"✅ <b>FIREBASE SCANNING COMPLETED!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>[{bar_complete}] 100.0%</code>\n\n"
-            f"📊 <b>Final Performance Summary:</b>\n"
-            f"├ 📋 <b>Total Checked:</b> <code>{total:,}</code>\n"
-            + (f"├ 🧹 <b>Duplicates Filtered:</b> <code>{dup_count:,}</code>\n" if dup_count > 0 else "")
-            + f"├ 🟢 <b>Active / Working:</b> <code>{len(active_results):,}</code>\n"
-            f"├ ⚠️ <b>Auth Protected:</b> <code>{len(protected_results):,}</code>\n"
-            f"├ 🔴 <b>Dead / Deactive:</b> <code>{inactive_count:,}</code>\n"
-            f"├ ⏱️ <b>Total Time:</b> <code>{tot_elapsed_str}</code>\n"
-            f"├ 🚀 <b>Average Speed:</b> <code>{int(avg_rate)} URLs/sec</code>\n"
-            f"└ 💎 <b>Diamonds Used:</b> <code>{format_diamonds(cost)}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 <i>Active Firebase result file is delivered below.</i>"
-        )
-        if progress_mid:
-            try:
-                edit(chat, progress_mid, summary_msg)
-            except Exception:
-                send(chat, summary_msg)
+            # Deliver Protected By Auth Firebase TXT file if any found
+            if protected_results:
+                protected_urls = list(dict.fromkeys(record[0] for record in protected_results))
+                if protected_urls:
+                    send_protected_firebase_txt(chat, protected_urls)
         else:
-            send(chat, summary_msg)
+            # <= 10 URLs: Send normal text messages in chat, exactly like before!
+            if progress_mid:
+                try:
+                    delete_message(chat, progress_mid)
+                except Exception:
+                    pass
 
-        # Deliver Active Firebase TXT file
-        if active_results:
-            active_urls = list(dict.fromkeys(record[0] for record in active_results))
-            send_active_firebase_txt(chat, active_urls)
-        else:
-            send(chat, f"ℹ️ <b>Scan Complete:</b> Total {total:,} URLs me se koi bhi Active/Working Firebase nahi mila.")
-
-        # Deliver Protected By Auth Firebase TXT file if any found
-        if protected_results:
-            protected_urls = list(dict.fromkeys(record[0] for record in protected_results))
-            if protected_urls:
-                send_protected_firebase_txt(chat, protected_urls)
+            for idx in range(total):
+                if idx not in ordered_results:
+                    continue
+                category, record = ordered_results[idx]
+                try:
+                    if category == "active":
+                        target = record[0]
+                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else (record[2] if len(record) > 2 and isinstance(record[2], int) else 0)
+                        online = record[2] if len(record) > 2 and isinstance(record[2], int) else 0
+                        offline = record[3] if len(record) > 3 and isinstance(record[3], int) else 0
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({idx + 1}/{total})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: 🟢 <b>WORKING / ACTIVE</b>\n"
+                            f"📊 Total Devices: <b>{total_dev}</b> | 🟢 Online: <b>{online}</b> | 🔴 Offline: <b>{offline}</b>"
+                        ))
+                    elif category == "protected":
+                        target = record[0]
+                        total_dev = record[2] if len(record) > 2 and isinstance(record[2], int) else 0
+                        device_info = f"\n📊 Total Devices: <b>{total_dev}</b>" if total_dev > 0 else ""
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({idx + 1}/{total})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: ⚠️ <b>PROTECTED BY AUTH</b> (<i>Firebase is active and you can use it only using correct auth/password</i>)"
+                            f"{device_info}"
+                        ))
+                    else:
+                        target = record[0] if isinstance(record, (list, tuple)) else str(record)
+                        reason = record[1] if isinstance(record, (list, tuple)) and len(record) > 1 else "Deactivated or unreachable"
+                        send(chat, (
+                            f"⚡ <b>Firebase Check ({idx + 1}/{total})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(target)}</code>\n"
+                            f"📌 Status: 🔴 <b>DEACTIVATED</b>\n"
+                            f"⚠️ Reason: <i>{esc(reason)}</i>"
+                        ))
+                except Exception:
+                    LOG.warning("Viewer text result delivery failed for item %d", idx, exc_info=True)
 
         # Deduct diamond only upon successful completion
         if cost > 0:
