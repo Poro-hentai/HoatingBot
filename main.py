@@ -119,6 +119,8 @@ media_group_timers = {}
 viewer_result_pages = {}
 apk_queues = {}
 apk_queue_workers = set()
+user_task_queues = {}
+user_task_workers = set()
 
 DEVICE_PATH_KEYS = ("All_User", "all_user", "All_Users", "bots", "devices", "users", "clients", "agents")
 PHONE_FIELD_KEYS = ("mobNo", "mobileNumber", "phoneNumber", "mobile", "phone", "number", "mno", "contact", "sim", "sim1", "sim2", "simNo", "simNumber")
@@ -1303,44 +1305,66 @@ def read_firebase_status(url):
     headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close", "Accept": "application/json"}
     root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
     
-    # 1. Ultra-fast root probe with shallow=true (detects active/protected/dead in 1 call)
+    # 1. First probe device endpoints directly to read full device status (online/offline)
+    # Common bot paths: /clients.json, /All_User.json, /devices.json, /users.json
+    device_paths = ["/clients.json", "/All_User.json", "/devices.json", "/users.json"]
+    last_err = None
+    has_auth_protection = False
+    
+    for path in device_paths:
+        try:
+            req = Request(root_url + path, headers=headers)
+            with urlopen(req, timeout=2.2) as response:
+                raw = response.read(200000).decode("utf-8", errors="ignore")
+                data = json.loads(raw) if raw else None
+            if isinstance(data, dict) and data:
+                summary = firebase_status_summary(data)
+                if summary[0] > 0:
+                    return summary
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                has_auth_protection = True
+            elif exc.code in {400, 404}:
+                last_err = exc
+            else:
+                last_err = exc
+        except Exception as exc:
+            last_err = exc
+
+    # 2. If common device nodes not found, probe root shallow or full
     try:
         req = Request(root_url + "/.json?shallow=true", headers=headers)
-        with urlopen(req, timeout=1.5) as response:
+        with urlopen(req, timeout=1.8) as response:
             raw = response.read(8192).decode("utf-8", errors="ignore")
             data = json.loads(raw) if raw else None
-        
         if data is not None:
-            device_count = len(data) if isinstance(data, dict) else 0
-            return (device_count, 0, 0, 0)
-        return (0, 0, 0, 0)
-
+            # Active database found, but no standard clients found
+            cnt = len(data) if isinstance(data, dict) else 1
+            return (cnt, 0, 0, 0)
     except HTTPError as exc:
         if exc.code in {401, 403}:
-            # Root is protected by auth rules, verify /clients.json?shallow=true once
-            try:
-                c_req = Request(root_url + "/clients.json?shallow=true", headers=headers)
-                with urlopen(c_req, timeout=1.2) as c_resp:
-                    c_raw = c_resp.read(8192).decode("utf-8", errors="ignore")
-                    c_data = json.loads(c_raw) if c_raw else None
-                if c_data is not None:
-                    return (len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
-            except HTTPError as c_exc:
-                if c_exc.code in {401, 403}:
-                    return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
-            except Exception:
-                pass
-            return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
-        if exc.code in {400, 404}:
-            raise ValueError("Ye wrong ya deactivated Firebase hai.")
-        raise ValueError(f"HTTP Error {exc.code}")
+            has_auth_protection = True
+        elif exc.code in {400, 404}:
+            last_err = exc
     except Exception as exc:
-        err_msg = str(exc)
+        last_err = exc
+
+    if has_auth_protection:
+        return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+
+    if last_err:
+        err_msg = str(last_err)
+        if isinstance(last_err, HTTPError):
+            if last_err.code in {400, 404}:
+                raise ValueError("Ye wrong ya deactivated Firebase hai.")
+            raise ValueError(f"HTTP Error {last_err.code}")
         if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg:
             raise ValueError("Ye wrong ya deactivated Firebase hai.")
         if "timed out" in err_msg.lower():
             raise ValueError("Connection timed out (Slow).")
         raise ValueError(f"Check failed: {err_msg[:100]}")
+
+    raise ValueError("Ye wrong ya deactivated Firebase hai.")
 
 def read_firebase_status_fast(url, deadline=3.0):
     try:
@@ -1353,7 +1377,9 @@ def check_viewer_target(target):
         res = read_firebase_status_fast(target)
         if isinstance(res, tuple) and res[0] == "protected":
             return "protected", (target, "Protected By Auth (Firebase is active and you can use it only using correct auth/password)", 0, 0, 0, 0)
-        return "active", (target, *res)
+        # res is (total, online, offline, unknown)
+        total_dev, online, offline, unknown = res
+        return "active", (target, total_dev, online, offline, unknown)
     except Exception as exc:
         err_msg = str(exc)
         if "Protected Rules" in err_msg or "Access Denied" in err_msg or "auth/password" in err_msg.lower():
@@ -1664,7 +1690,7 @@ def process_firebase_view(message):
                 try:
                     if category == "active":
                         target = record[0]
-                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else (record[2] if len(record) > 2 and isinstance(record[2], int) else 0)
+                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else 0
                         online = record[2] if len(record) > 2 and isinstance(record[2], int) else 0
                         offline = record[3] if len(record) > 3 and isinstance(record[3], int) else 0
                         send(chat, (
@@ -1718,6 +1744,7 @@ def process_firebase_view(message):
                 active_viewer_users.discard(uid)
         gc.collect()
     another_task_prompt(chat)
+    drain_user_task_queue(uid)
 
 # ═══════════════════════════════════════════════════════════════
 # DEDUPLICATION TOOL ENGINE
@@ -1879,6 +1906,7 @@ def process_dedup_file(message):
             clean_path.unlink(missing_ok=True)
         gc.collect()
     another_task_prompt(chat)
+    drain_user_task_queue(uid)
 
 def process_dedup_text(message):
     uid, chat = message["from"]["id"], message["chat"]["id"]
@@ -1956,7 +1984,7 @@ def process_dedup_text(message):
             active_dedup_users.discard(uid)
         gc.collect()
     another_task_prompt(chat)
-    another_task_prompt(chat)
+    drain_user_task_queue(uid)
 
 # ═══════════════════════════════════════════════════════════════
 # EXTRACTION WORKFLOW WITH REFUND & DUMP CHANNELS
@@ -2137,6 +2165,7 @@ def process_extraction(message):
         session(uid)
         gc.collect()
     another_task_prompt(chat)
+    drain_user_task_queue(uid)
 
 # ═══════════════════════════════════════════════════════════════
 # ORDERS & PAYMENT SYSTEM
@@ -2393,6 +2422,35 @@ def drain_apk_queue(uid):
         if restart_queue and not submit_work(drain_apk_queue, uid):
             with LIMIT_LOCK:
                 apk_queue_workers.discard(uid)
+
+def queue_user_task(uid, chat, task_fn, msg_payload, task_name="Task"):
+    """Queue a task for the user if another process is currently running."""
+    with LIMIT_LOCK:
+        queue = user_task_queues.setdefault(uid, [])
+        if len(queue) >= 10:
+            send(chat, "⏳ Aapki task queue full hai (Max 10). Kripya purane tasks poore hone ka intezaar karein.")
+            return False
+        queue.append((task_fn, msg_payload, task_name))
+        q_pos = len(queue)
+    
+    send(chat, f"⏳ <b>A process is running, after finishing that progress I will start this.</b>\n\n📌 Task: <b>{task_name}</b> (Queue Position: #{q_pos})")
+    return True
+
+def drain_user_task_queue(uid):
+    """Run the next queued task for this user as soon as the active process finishes."""
+    next_task = None
+    with LIMIT_LOCK:
+        queue = user_task_queues.get(uid, [])
+        if queue:
+            next_task = queue.pop(0)
+            if not queue:
+                user_task_queues.pop(uid, None)
+    
+    if next_task:
+        task_fn, msg_payload, task_name = next_task
+        LOG.info("Starting queued task '%s' for user %s", task_name, uid)
+        submit_work(task_fn, msg_payload)
+
 
 # ═══════════════════════════════════════════════════════════════
 # CALLBACK QUERY ROUTING
@@ -2663,7 +2721,8 @@ def handle_message(msg_obj):
                 path = download(doc["file_id"])
                 if state_action == "dedup":
                     if is_process_running(uid):
-                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        queue_user_task(uid, chat, process_dedup_file, {**msg_obj, "downloaded_path": str(path), "doc_name": doc.get("file_name", "data.txt")}, "Deduplication (.txt)")
+                        path = None
                         return
                     submit_work(
                         process_dedup_file,
@@ -2675,13 +2734,13 @@ def handle_message(msg_obj):
                 targets = firebase_targets_from_text(text_content)
                 if targets or state_action == "firebase_view":
                     if is_process_running(uid):
-                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        queue_user_task(uid, chat, process_firebase_view, {**msg_obj, "text": text_content}, "Firebase Viewer (.txt)")
                         return
                     submit_work(process_firebase_view, {**msg_obj, "text": text_content})
                     return
                 elif state_action == "extract":
                     if is_process_running(uid):
-                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+                        queue_user_task(uid, chat, process_extraction, msg_obj, "Extraction (.txt)")
                         return
                     submit_work(process_extraction, msg_obj)
                     return
@@ -2700,28 +2759,28 @@ def handle_message(msg_obj):
     if is_admin(uid) and state and handle_admin_input(msg_obj, state, text): return
 
     if state_action == "extract":
-        if is_process_running(uid):
-            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
-            return
         if not looks_like_url(text):
             send(chat, "⚠️ Please send an APK file or a valid public web/Firebase URL.")
+            return
+        if is_process_running(uid):
+            queue_user_task(uid, chat, process_extraction, msg_obj, "Extraction (URL)")
             return
         submit_work(process_extraction, msg_obj)
         return
 
     if state_action == "firebase_view":
-        if is_process_running(uid):
-            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
-            return
         if not firebase_targets_from_text(text):
             send(chat, "⚠️ Please send a valid Firebase Realtime Database URL.")
+            return
+        if is_process_running(uid):
+            queue_user_task(uid, chat, process_firebase_view, msg_obj, "Firebase Viewer")
             return
         submit_work(process_firebase_view, msg_obj)
         return
 
     if state_action == "dedup":
         if is_process_running(uid):
-            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            queue_user_task(uid, chat, process_dedup_text, msg_obj, "Deduplication (Text)")
             return
         submit_work(process_dedup_text, msg_obj)
         return
@@ -2729,7 +2788,7 @@ def handle_message(msg_obj):
     # Auto-detection: If user directly sends Firebase URL(s) without menu, check them immediately
     if firebase_targets_from_text(text):
         if is_process_running(uid):
-            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            queue_user_task(uid, chat, process_firebase_view, msg_obj, "Firebase Viewer (Auto)")
             return
         submit_work(process_firebase_view, msg_obj)
         return
