@@ -938,6 +938,46 @@ def save_extract(uid, urls, source):
         user[f"{source}_extracts"] += 1
     return new_urls
 
+def save_viewer_history(uid, active_results, protected_results, source="viewer"):
+    """Save active and protected Firebase URLs checked by the user into events and global firebase collection."""
+    all_urls = []
+    if active_results:
+        all_urls.extend(r[0] if isinstance(r, (list, tuple)) else str(r) for r in active_results)
+    if protected_results:
+        all_urls.extend(r[0] if isinstance(r, (list, tuple)) else str(r) for r in protected_results)
+    
+    urls = clean_firebase_url_list(all_urls)
+    if not urls:
+        return []
+    
+    new_urls = []
+    if firebase is not None:
+        for url in urls:
+            try:
+                result = firebase.update_one(
+                    {"url": url},
+                    {"$setOnInsert": {"url": url, "first_user_id": uid, "first_seen": now(), "source": source}},
+                    upsert=True
+                )
+                if result.upserted_id:
+                    new_urls.append(url)
+                # Deduplicated insert into user events
+                events.update_one(
+                    {"user_id": uid, "url": url},
+                    {"$setOnInsert": {"type": "viewer", "user_id": uid, "url": url, "source": source, "created_at": now()}},
+                    upsert=True
+                )
+            except Exception:
+                LOG.warning("Failed to save viewer history in mongo for url %s", url, exc_info=True)
+    else:
+        for url in urls:
+            if url not in fallback_firebase:
+                fallback_firebase[url] = {"url": url, "first_user_id": uid, "first_seen": now(), "source": source}
+                new_urls.append(url)
+            if not any(e.get("user_id") == uid and e.get("url") == url for e in fallback_events):
+                fallback_events.append({"type": "viewer", "user_id": uid, "url": url, "source": source, "created_at": now()})
+    return new_urls
+
 def update_balance(uid, amount):
     if users is not None:
         users.update_one({"user_id": uid}, {"$inc": {"diamonds": amount}})
@@ -1119,11 +1159,32 @@ def user_history_firebase_urls(uid):
     return unique
 
 def send_user_history_txt(chat, uid):
-    """Send one TXT containing only the requesting user's unique history."""
+    """Send one TXT containing only the requesting user's unique history without any duplicates."""
     urls = user_history_firebase_urls(uid)
     if not urls:
         return False
-    return send_extraction_txt(chat, "My Unique Firebase History", urls)
+    temp_dir = tempfile.gettempdir()
+    filepath = Path(temp_dir) / f"Firebase_History_{uid}_{int(time.time())}.txt"
+    try:
+        content = "\n".join(urls)
+        filepath.write_text(content, encoding="utf-8")
+        caption = (
+            f"📜 <b>Your Firebase History ({len(urls):,})</b>\n\n"
+            f"Aapki extraction aur viewer check ki gayi saari unique Firebase URLs ki list.\n"
+            f"🔗 Total Unique Firebase: <b>{len(urls):,}</b>"
+        )
+        send_document(chat, filepath, caption=caption)
+        return True
+    except Exception as exc:
+        LOG.exception("Failed to send user history txt")
+        send(chat, f"❌ History file send karne me error: <code>{esc(str(exc)[:200])}</code>")
+        return False
+    finally:
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except Exception:
+                pass
 
 
 def send_viewer_result_pages(chat, active_results, protected_results, inactive_results):
@@ -1723,6 +1784,13 @@ def process_firebase_view(message):
                         ))
                 except Exception:
                     LOG.warning("Viewer text result delivery failed for item %d", idx, exc_info=True)
+
+        # Save active and protected Firebase URLs to user history (deduplicated)
+        try:
+            viewer_src = "viewer_txt" if message.get("document") or message.get("is_txt_file") else "viewer"
+            save_viewer_history(uid, active_results, protected_results, source=viewer_src)
+        except Exception:
+            LOG.warning("Failed to save viewer history for user %s", uid, exc_info=True)
 
         # Deduct diamond only upon successful completion
         if cost > 0:
@@ -2734,9 +2802,9 @@ def handle_message(msg_obj):
                 targets = firebase_targets_from_text(text_content)
                 if targets or state_action == "firebase_view":
                     if is_process_running(uid):
-                        queue_user_task(uid, chat, process_firebase_view, {**msg_obj, "text": text_content}, "Firebase Viewer (.txt)")
+                        queue_user_task(uid, chat, process_firebase_view, {**msg_obj, "text": text_content, "is_txt_file": True}, "Firebase Viewer (.txt)")
                         return
-                    submit_work(process_firebase_view, {**msg_obj, "text": text_content})
+                    submit_work(process_firebase_view, {**msg_obj, "text": text_content, "is_txt_file": True})
                     return
                 elif state_action == "extract":
                     if is_process_running(uid):
@@ -2923,6 +2991,12 @@ def main():
     except OSError as exc:
         LOG.warning("Health server could not bind port %s: %s. Continuing with Telegram bot.", port, exc)
     tg("deleteWebhook",{"drop_pending_updates":False})
+    try:
+        tg("setMyDescription", {"description": "By @Scripter_Shadow"})
+        tg("setMyShortDescription", {"short_description": "By @Scripter_Shadow"})
+        LOG.info("Updated Telegram bot description and short description to 'By @Scripter_Shadow'")
+    except Exception as exc:
+        LOG.warning("Could not set Telegram bot description: %s", exc)
     LOG.info("⚡ Bot live as @%s", BOT_USERNAME)
     threading.Thread(target=bot_watchdog, daemon=True, name="bot-watchdog").start()
     
