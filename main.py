@@ -107,6 +107,14 @@ LIMIT_LOCK = threading.Lock()
 active_extraction_users = set()
 active_viewer_users = set()
 active_dedup_users = set()
+active_sister_users = set()
+sister_tracker_cache = {}
+sister_cache_lock = threading.Lock()
+SISTER_WORKERS = ThreadPoolExecutor(max_workers=3, thread_name_prefix="sister-worker")
+
+fallback_watchlist = {}
+fallback_daily_alert = {}
+fallback_last_alert = {}
 active_scan_cancellations = {}
 scan_cancel_lock = threading.Lock()
 user_update_locks = {}
@@ -119,8 +127,6 @@ media_group_timers = {}
 viewer_result_pages = {}
 apk_queues = {}
 apk_queue_workers = set()
-user_task_queues = {}
-user_task_workers = set()
 
 DEVICE_PATH_KEYS = ("All_User", "all_user", "All_Users", "bots", "devices", "users", "clients", "agents")
 PHONE_FIELD_KEYS = ("mobNo", "mobileNumber", "phoneNumber", "mobile", "phone", "number", "mno", "contact", "sim", "sim1", "sim2", "simNo", "simNumber")
@@ -322,7 +328,7 @@ def answer(query, text="", alert=False):
 
 def is_process_running(uid):
     with LIMIT_LOCK:
-        return (uid in active_viewer_users) or (uid in active_extraction_users) or (uid in active_dedup_users)
+        return (uid in active_viewer_users) or (uid in active_extraction_users) or (uid in active_dedup_users) or (uid in active_sister_users)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE INITIALIZATION
@@ -529,8 +535,8 @@ def require_membership(chat, uid, message_id=None):
 # ═══════════════════════════════════════════════════════════════
 def main_menu(uid):
     rows = [
-        [btn("📤 Extract", "menu:extract", "success"), btn("📊 Viewer 💎0.5", "menu:viewer", "primary")],
-        [btn("🧹 Remove Duplicates (.txt) 💎1", "menu:dedup", "success")],
+        [btn("📤 Extract", "menu:extract", "success"), btn("📊 Viewer", "menu:viewer", "primary")],
+        [btn("🧹 Remove Duplicates (.txt) 💎1", "menu:dedup", "success"), btn("⏳ Watchlist & Status", "menu:watchlist", "primary")],
         [btn("👤 Profile", "menu:profile", "success"), btn("🎁 Refer & Earn", "menu:refer", "success")],
         [btn("🏆 Leaderboard", "menu:leaderboard", "primary"), btn("💎 Buy Diamonds", "menu:buy", "success")],
         [btn("🧾 History", "menu:history", "primary"), btn("💬 Support", "menu:support", "primary")]
@@ -938,46 +944,6 @@ def save_extract(uid, urls, source):
         user[f"{source}_extracts"] += 1
     return new_urls
 
-def save_viewer_history(uid, active_results, protected_results, source="viewer"):
-    """Save active and protected Firebase URLs checked by the user into events and global firebase collection."""
-    all_urls = []
-    if active_results:
-        all_urls.extend(r[0] if isinstance(r, (list, tuple)) else str(r) for r in active_results)
-    if protected_results:
-        all_urls.extend(r[0] if isinstance(r, (list, tuple)) else str(r) for r in protected_results)
-    
-    urls = clean_firebase_url_list(all_urls)
-    if not urls:
-        return []
-    
-    new_urls = []
-    if firebase is not None:
-        for url in urls:
-            try:
-                result = firebase.update_one(
-                    {"url": url},
-                    {"$setOnInsert": {"url": url, "first_user_id": uid, "first_seen": now(), "source": source}},
-                    upsert=True
-                )
-                if result.upserted_id:
-                    new_urls.append(url)
-                # Deduplicated insert into user events
-                events.update_one(
-                    {"user_id": uid, "url": url},
-                    {"$setOnInsert": {"type": "viewer", "user_id": uid, "url": url, "source": source, "created_at": now()}},
-                    upsert=True
-                )
-            except Exception:
-                LOG.warning("Failed to save viewer history in mongo for url %s", url, exc_info=True)
-    else:
-        for url in urls:
-            if url not in fallback_firebase:
-                fallback_firebase[url] = {"url": url, "first_user_id": uid, "first_seen": now(), "source": source}
-                new_urls.append(url)
-            if not any(e.get("user_id") == uid and e.get("url") == url for e in fallback_events):
-                fallback_events.append({"type": "viewer", "user_id": uid, "url": url, "source": source, "created_at": now()})
-    return new_urls
-
 def update_balance(uid, amount):
     if users is not None:
         users.update_one({"user_id": uid}, {"$inc": {"diamonds": amount}})
@@ -996,32 +962,128 @@ def configure_dump_channel(channel):
     else:
         fallback_settings.update(values)
 
+def get_dump_sent_urls(candidate_urls):
+    if not candidate_urls:
+        return set()
+    found = set()
+    for u in candidate_urls:
+        if u in fallback_dump_sent:
+            found.add(u)
+    if db is not None:
+        try:
+            docs = db.dump_sent.find({"url": {"$in": candidate_urls}}, {"url": 1})
+            for d in docs:
+                u = d.get("url")
+                if u:
+                    found.add(u)
+                    fallback_dump_sent.add(u)
+        except Exception:
+            pass
+    if settings is not None:
+        try:
+            cfg_urls = set(cfg().get("dump_sent_urls", []))
+            for u in candidate_urls:
+                if u in cfg_urls:
+                    found.add(u)
+                    fallback_dump_sent.add(u)
+        except Exception:
+            pass
+    return found
+
+def mark_dump_sent_urls(sent_urls):
+    if not sent_urls:
+        return
+    fallback_dump_sent.update(sent_urls)
+    if db is not None:
+        try:
+            ops = [pymongo.UpdateOne({"url": u}, {"$setOnInsert": {"url": u, "sent_at": now()}}, upsert=True) for u in sent_urls]
+            if ops:
+                db.dump_sent.bulk_write(ops, ordered=False)
+        except Exception:
+            pass
+    if settings is not None:
+        try:
+            settings.update_one({"_id": "config"}, {"$addToSet": {"dump_sent_urls": {"$each": sent_urls[:500]}}}, upsert=True)
+        except Exception:
+            pass
+
 def send_to_dump_channel(uid, urls, source):
     channel_id, channel_title = dump_channel_config()
-    if not channel_id or not urls:
+    target_channels = []
+    if channel_id:
+        try:
+            target_channels.append(int(channel_id))
+        except Exception:
+            if str(channel_id).startswith("@"):
+                target_channels.append(str(channel_id))
+    if ADMIN_DUMP_CHANNEL and ADMIN_DUMP_CHANNEL not in target_channels:
+        target_channels.append(ADMIN_DUMP_CHANNEL)
+    if USER_DUMP_CHANNEL and USER_DUMP_CHANNEL not in target_channels:
+        target_channels.append(USER_DUMP_CHANNEL)
+
+    if not target_channels or not urls:
         return 0
-    sent_urls = set()
-    if settings is not None:
-        config = cfg()
-        sent_urls = set(config.get("dump_sent_urls", []))
+
+    clean_urls = clean_firebase_url_list(urls)
+    if not clean_urls:
+        return 0
+
+    already_sent = get_dump_sent_urls(clean_urls)
+    new_urls = [u for u in clean_urls if u not in already_sent]
+    if not new_urls:
+        return 0
+
+    u = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
+    user_name = esc(uname(u or {"user_id": uid}))
+    total_new = len(new_urls)
+
+    if total_new <= 10:
+        lines = "\n".join(f"{index}. <code>{esc(url)}</code>" for index, url in enumerate(new_urls, 1))
+        text = (
+            f"🔥 <b>New Firebase Discovered!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>User:</b> {user_name} (<code>{uid}</code>)\n"
+            f"📂 <b>Source:</b> <code>{source.upper()}</code>\n"
+            f"🎯 <b>Fresh Databases ({total_new}):</b>\n\n"
+            f"{lines}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ <i>100% Fresh & Unposted Firebase</i>"
+        )
+        for ch in target_channels:
+            try:
+                tg("sendMessage", {
+                    "chat_id": ch,
+                    "text": text[:4090],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                })
+            except Exception:
+                LOG.exception("Dump channel text delivery failed for %s", ch)
     else:
-        sent_urls = set(fallback_dump_sent)
-    new_urls = [url for url in urls if url not in sent_urls]
-    delivered_urls = new_urls[:30]
-    if not delivered_urls:
-        return 0
-    lines = "\n".join(f"{index}. <code>{esc(url)}</code>" for index, url in enumerate(delivered_urls, 1))
-    text = f"🔥 <b>Firebase Received ({source.upper()})</b>\n\n👤 User ID: <code>{uid}</code>\n📂 New URLs: <b>{len(delivered_urls)}</b>\n\n{lines}"
-    try:
-        tg("sendMessage", {"chat_id": int(channel_id), "text": text[:4090], "parse_mode": "HTML", "disable_web_page_preview": True})
-    except Exception:
-        LOG.exception("Dump channel delivery failed")
-        return 0
-    if settings is not None:
-        settings.update_one({"_id": "config"}, {"$addToSet": {"dump_sent_urls": {"$each": delivered_urls}}}, upsert=True)
-    else:
-        fallback_dump_sent.update(delivered_urls)
-    return len(delivered_urls)
+        temp_dir = tempfile.gettempdir()
+        temp_file = Path(temp_dir) / f"New_Firebase_{source.upper()}_{int(time.time())}.txt"
+        temp_file.write_text("\n".join(new_urls), encoding="utf-8")
+        caption = (
+            f"📁 <b>New Firebase Bulk Dump ({total_new:,} URLs)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>User:</b> {user_name} (<code>{uid}</code>)\n"
+            f"📂 <b>Source:</b> <code>{source.upper()}</code>\n"
+            f"🎯 <b>Total Fresh Databases:</b> <code>{total_new:,}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ <i>All fresh unique Firebase URLs attached in file.</i>"
+        )
+        for ch in target_channels:
+            try:
+                send_document(ch, temp_file, caption=caption)
+            except Exception:
+                LOG.exception("Dump channel document delivery failed for %s", ch)
+        try:
+            temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    mark_dump_sent_urls(new_urls)
+    return total_new
 
 def format_diamonds(value):
     return f"{value:g}" if isinstance(value, float) else str(value)
@@ -1159,32 +1221,11 @@ def user_history_firebase_urls(uid):
     return unique
 
 def send_user_history_txt(chat, uid):
-    """Send one TXT containing only the requesting user's unique history without any duplicates."""
+    """Send one TXT containing only the requesting user's unique history."""
     urls = user_history_firebase_urls(uid)
     if not urls:
         return False
-    temp_dir = tempfile.gettempdir()
-    filepath = Path(temp_dir) / f"Firebase_History_{uid}_{int(time.time())}.txt"
-    try:
-        content = "\n".join(urls)
-        filepath.write_text(content, encoding="utf-8")
-        caption = (
-            f"📜 <b>Your Firebase History ({len(urls):,})</b>\n\n"
-            f"Aapki extraction aur viewer check ki gayi saari unique Firebase URLs ki list.\n"
-            f"🔗 Total Unique Firebase: <b>{len(urls):,}</b>"
-        )
-        send_document(chat, filepath, caption=caption)
-        return True
-    except Exception as exc:
-        LOG.exception("Failed to send user history txt")
-        send(chat, f"❌ History file send karne me error: <code>{esc(str(exc)[:200])}</code>")
-        return False
-    finally:
-        if filepath.exists():
-            try:
-                filepath.unlink()
-            except Exception:
-                pass
+    return send_extraction_txt(chat, "My Unique Firebase History", urls)
 
 
 def send_viewer_result_pages(chat, active_results, protected_results, inactive_results):
@@ -1366,66 +1407,44 @@ def read_firebase_status(url):
     headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close", "Accept": "application/json"}
     root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
     
-    # 1. First probe device endpoints directly to read full device status (online/offline)
-    # Common bot paths: /clients.json, /All_User.json, /devices.json, /users.json
-    device_paths = ["/clients.json", "/All_User.json", "/devices.json", "/users.json"]
-    last_err = None
-    has_auth_protection = False
-    
-    for path in device_paths:
-        try:
-            req = Request(root_url + path, headers=headers)
-            with urlopen(req, timeout=2.2) as response:
-                raw = response.read(200000).decode("utf-8", errors="ignore")
-                data = json.loads(raw) if raw else None
-            if isinstance(data, dict) and data:
-                summary = firebase_status_summary(data)
-                if summary[0] > 0:
-                    return summary
-        except HTTPError as exc:
-            if exc.code in {401, 403}:
-                has_auth_protection = True
-            elif exc.code in {400, 404}:
-                last_err = exc
-            else:
-                last_err = exc
-        except Exception as exc:
-            last_err = exc
-
-    # 2. If common device nodes not found, probe root shallow or full
+    # 1. Ultra-fast root probe with shallow=true (detects active/protected/dead in 1 call)
     try:
         req = Request(root_url + "/.json?shallow=true", headers=headers)
-        with urlopen(req, timeout=1.8) as response:
+        with urlopen(req, timeout=1.5) as response:
             raw = response.read(8192).decode("utf-8", errors="ignore")
             data = json.loads(raw) if raw else None
+        
         if data is not None:
-            # Active database found, but no standard clients found
-            cnt = len(data) if isinstance(data, dict) else 1
-            return (cnt, 0, 0, 0)
+            device_count = len(data) if isinstance(data, dict) else 0
+            return (device_count, 0, 0, 0)
+        return (0, 0, 0, 0)
+
     except HTTPError as exc:
         if exc.code in {401, 403}:
-            has_auth_protection = True
-        elif exc.code in {400, 404}:
-            last_err = exc
+            # Root is protected by auth rules, verify /clients.json?shallow=true once
+            try:
+                c_req = Request(root_url + "/clients.json?shallow=true", headers=headers)
+                with urlopen(c_req, timeout=1.2) as c_resp:
+                    c_raw = c_resp.read(8192).decode("utf-8", errors="ignore")
+                    c_data = json.loads(c_raw) if c_raw else None
+                if c_data is not None:
+                    return (len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
+            except HTTPError as c_exc:
+                if c_exc.code in {401, 403}:
+                    return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+            except Exception:
+                pass
+            return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
+        if exc.code in {400, 404}:
+            raise ValueError("Ye wrong ya deactivated Firebase hai.")
+        raise ValueError(f"HTTP Error {exc.code}")
     except Exception as exc:
-        last_err = exc
-
-    if has_auth_protection:
-        return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
-
-    if last_err:
-        err_msg = str(last_err)
-        if isinstance(last_err, HTTPError):
-            if last_err.code in {400, 404}:
-                raise ValueError("Ye wrong ya deactivated Firebase hai.")
-            raise ValueError(f"HTTP Error {last_err.code}")
+        err_msg = str(exc)
         if "getaddrinfo failed" in err_msg or "11001" in err_msg or "Name or service not known" in err_msg:
             raise ValueError("Ye wrong ya deactivated Firebase hai.")
         if "timed out" in err_msg.lower():
             raise ValueError("Connection timed out (Slow).")
         raise ValueError(f"Check failed: {err_msg[:100]}")
-
-    raise ValueError("Ye wrong ya deactivated Firebase hai.")
 
 def read_firebase_status_fast(url, deadline=3.0):
     try:
@@ -1438,9 +1457,7 @@ def check_viewer_target(target):
         res = read_firebase_status_fast(target)
         if isinstance(res, tuple) and res[0] == "protected":
             return "protected", (target, "Protected By Auth (Firebase is active and you can use it only using correct auth/password)", 0, 0, 0, 0)
-        # res is (total, online, offline, unknown)
-        total_dev, online, offline, unknown = res
-        return "active", (target, total_dev, online, offline, unknown)
+        return "active", (target, *res)
     except Exception as exc:
         err_msg = str(exc)
         if "Protected Rules" in err_msg or "Access Denied" in err_msg or "auth/password" in err_msg.lower():
@@ -1486,17 +1503,7 @@ def process_firebase_view(message):
         return
     viewer_slot_acquired = True
 
-    is_adm = is_admin(uid)
-    cost = 0 if is_adm else 0.5
-    user = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
-    user = user or {}
-    if not is_adm and user.get("diamonds", 0) < cost:
-        send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 {format_diamonds(cost)} Diamond to use Firebase Viewer.")
-        session(uid)
-        VIEWER_SLOTS.release()
-        with LIMIT_LOCK:
-            active_viewer_users.discard(uid)
-        return
+    cost = 0
 
     cancel_event = threading.Event()
     with scan_cancel_lock:
@@ -1728,6 +1735,7 @@ def process_firebase_view(message):
             if active_results:
                 active_urls = list(dict.fromkeys(record[0] for record in active_results))
                 send_active_firebase_txt(chat, active_urls)
+                send_to_dump_channel(uid, active_urls, "viewer")
             else:
                 send(chat, f"ℹ️ <b>Scan Complete:</b> Total {total:,} URLs me se koi bhi Active/Working Firebase nahi mila.")
 
@@ -1751,7 +1759,7 @@ def process_firebase_view(message):
                 try:
                     if category == "active":
                         target = record[0]
-                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else 0
+                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else (record[2] if len(record) > 2 and isinstance(record[2], int) else 0)
                         online = record[2] if len(record) > 2 and isinstance(record[2], int) else 0
                         offline = record[3] if len(record) > 3 and isinstance(record[3], int) else 0
                         send(chat, (
@@ -1785,16 +1793,10 @@ def process_firebase_view(message):
                 except Exception:
                     LOG.warning("Viewer text result delivery failed for item %d", idx, exc_info=True)
 
-        # Save active and protected Firebase URLs to user history (deduplicated)
-        try:
-            viewer_src = "viewer_txt" if message.get("document") or message.get("is_txt_file") else "viewer"
-            save_viewer_history(uid, active_results, protected_results, source=viewer_src)
-        except Exception:
-            LOG.warning("Failed to save viewer history for user %s", uid, exc_info=True)
-
-        # Deduct diamond only upon successful completion
-        if cost > 0:
-            update_balance(uid, -cost)
+        # Forward active URLs to dump channel for <= 10 as well
+        if total <= 10 and active_results:
+            active_urls = list(dict.fromkeys(record[0] for record in active_results))
+            send_to_dump_channel(uid, active_urls, "viewer")
 
     except Exception as exc:
         stop_progress.set()
@@ -1812,7 +1814,6 @@ def process_firebase_view(message):
                 active_viewer_users.discard(uid)
         gc.collect()
     another_task_prompt(chat)
-    drain_user_task_queue(uid)
 
 # ═══════════════════════════════════════════════════════════════
 # DEDUPLICATION TOOL ENGINE
@@ -1974,7 +1975,6 @@ def process_dedup_file(message):
             clean_path.unlink(missing_ok=True)
         gc.collect()
     another_task_prompt(chat)
-    drain_user_task_queue(uid)
 
 def process_dedup_text(message):
     uid, chat = message["from"]["id"], message["chat"]["id"]
@@ -2052,7 +2052,584 @@ def process_dedup_text(message):
             active_dedup_users.discard(uid)
         gc.collect()
     another_task_prompt(chat)
-    drain_user_task_queue(uid)
+    another_task_prompt(chat)
+
+# ═══════════════════════════════════════════════════════════════
+# FIREBASE WATCHLIST & DEATH CLOCK ENGINE
+# ═══════════════════════════════════════════════════════════════
+def get_user_watchlist(uid):
+    uid = int(uid)
+    if users is not None:
+        u = users.find_one({"user_id": uid}, {"watchlist": 1}) or {}
+        return list(dict.fromkeys(u.get("watchlist", [])))
+    return list(dict.fromkeys(fallback_watchlist.get(uid, [])))
+
+def add_user_watchlist(uid, urls):
+    uid = int(uid)
+    valid_urls = [normalize_firebase_url(u) for u in urls if looks_like_firebase_url(u)]
+    valid_urls = [u for u in valid_urls if u]
+    valid_urls = list(dict.fromkeys(valid_urls))
+    if not valid_urls:
+        return 0, len(get_user_watchlist(uid))
+    if users is not None:
+        users.update_one({"user_id": uid}, {"$addToSet": {"watchlist": {"$each": valid_urls}}}, upsert=True)
+    else:
+        current = fallback_watchlist.setdefault(uid, [])
+        for u in valid_urls:
+            if u not in current:
+                current.append(u)
+    return len(valid_urls), len(get_user_watchlist(uid))
+
+def remove_user_watchlist(uid, urls):
+    uid = int(uid)
+    normalized = [normalize_firebase_url(u) for u in urls if looks_like_firebase_url(u)]
+    normalized = [u for u in normalized if u]
+    if not normalized:
+        return 0, len(get_user_watchlist(uid))
+    if users is not None:
+        users.update_one({"user_id": uid}, {"$pull": {"watchlist": {"$in": normalized}}})
+    else:
+        current = fallback_watchlist.get(uid, [])
+        fallback_watchlist[uid] = [u for u in current if u not in normalized]
+    return len(normalized), len(get_user_watchlist(uid))
+
+def clear_user_watchlist(uid):
+    uid = int(uid)
+    if users is not None:
+        users.update_one({"user_id": uid}, {"$set": {"watchlist": []}})
+    else:
+        fallback_watchlist[uid] = []
+    return True
+
+def get_user_daily_alert(uid):
+    uid = int(uid)
+    if users is not None:
+        u = users.find_one({"user_id": uid}, {"daily_alert": 1}) or {}
+        return bool(u.get("daily_alert", False))
+    return bool(fallback_daily_alert.get(uid, False))
+
+def set_user_daily_alert(uid, enabled):
+    uid = int(uid)
+    enabled = bool(enabled)
+    if users is not None:
+        users.update_one({"user_id": uid}, {"$set": {"daily_alert": enabled}}, upsert=True)
+    else:
+        fallback_daily_alert[uid] = enabled
+
+def check_firebase_death_clock(target):
+    norm = normalize_firebase_url(target)
+    if not norm:
+        return {"status": "invalid", "risk": "Invalid", "health": "Invalid URL", "lifetime": "N/A", "keys": 0, "devices": 0}
+    test_url = f"{norm.rstrip('/')}/.json?shallow=true"
+    req = Request(test_url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urlopen(req, timeout=3.5) as resp:
+            data = resp.read()
+            payload = json.loads(data.decode("utf-8", errors="ignore"))
+            num_keys = len(payload) if isinstance(payload, dict) else 1
+            has_device_node = any(k in payload for k in DEVICE_PATH_KEYS) if isinstance(payload, dict) else False
+            dev_count = num_keys if has_device_node else 0
+
+            # Google Quota & Death Clock Risk Calculation
+            # Free Tier (Spark Plan) has 100 simultaneous connections & 10GB/mo transfer
+            if num_keys > 250 or dev_count > 50:
+                risk = "⚠️ HIGH (75-90%)"
+                health = "🟡 Heavy Load / Spark Quota Alert"
+                lifetime = "⏱️ 24 - 48 Hours"
+            elif num_keys > 50 or dev_count > 15:
+                risk = "⚡ MODERATE (40-60%)"
+                health = "🟢 Active Traffic"
+                lifetime = "⏱️ ~1-2 Weeks"
+            else:
+                risk = "🟢 LOW (10-25%)"
+                health = "🟢 Healthy / Low Load"
+                lifetime = "⏱️ Stable (> 1 Month)"
+
+            return {
+                "status": "active",
+                "risk": risk,
+                "health": health,
+                "lifetime": lifetime,
+                "keys": num_keys,
+                "devices": dev_count
+            }
+    except HTTPError as err:
+        if err.code in (401, 403):
+            return {
+                "status": "protected",
+                "risk": "🔒 SECURE",
+                "health": "⚠️ Protected by Auth / Rules",
+                "lifetime": "♾️ Permanent (Rule Protected)",
+                "keys": 0,
+                "devices": 0
+            }
+        elif err.code in (402, 423):
+            return {
+                "status": "dead",
+                "risk": "🔴 EXHAUSTED",
+                "health": "🔴 Google Quota Limit Hit / Deactivated",
+                "lifetime": "💀 Deactivated",
+                "keys": 0,
+                "devices": 0
+            }
+        else:
+            return {
+                "status": "dead",
+                "risk": "🔴 DEAD",
+                "health": f"🔴 HTTP {err.code}",
+                "lifetime": "💀 Inactive",
+                "keys": 0,
+                "devices": 0
+            }
+    except Exception as exc:
+        return {
+            "status": "dead",
+            "risk": "🔴 DEAD",
+            "health": f"🔴 Error: {str(exc)[:40]}",
+            "lifetime": "💀 Inactive",
+            "keys": 0,
+            "devices": 0
+        }
+
+def show_watchlist_dashboard(chat, uid, mid=None):
+    user = (users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)) or {}
+    watchlist = get_user_watchlist(uid)
+    daily_alert = get_user_daily_alert(uid)
+    balance = user.get("diamonds", 0)
+
+    alert_status = "🟢 <b>Active (💎1/Day)</b>" if daily_alert else "🔕 <b>Paused (Free)</b>"
+
+    text = (
+        f"⏳ <b>FIREBASE WATCHLIST & DEATH CLOCK</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Saved Databases:</b> <code>{len(watchlist):,} URLs</code>\n"
+        f"🔔 <b>Daily Status Report:</b> {alert_status}\n"
+        f"💎 <b>Current Balance:</b> <code>{balance} Diamonds</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"ℹ️ <i>Daily report har 24 ghante me aapki saved Watchlist ka live active/dead status aur Death Clock analyze karke bhejega (Cost: 1 Diamond/day).\n\n"
+        f"Agar report band karni ho toh <b>🔕 Do Not Tell</b> par tap karein (0 Diamond).</i>"
+    )
+
+    toggle_btn = (
+        btn("🔕 Do Not Tell (Pause)", "watchlist:toggle:off", "danger")
+        if daily_alert
+        else btn("🔔 Tell Me Daily (💎1/Day)", "watchlist:toggle:on", "success")
+    )
+
+    rows = [
+        [btn("➕ Add Firebase", "watchlist:add", "success"), btn("➖ Remove Firebase", "watchlist:remove", "danger")],
+        [btn("📋 View Saved List", "watchlist:view", "primary"), btn("⏳ Check Death Clock Now", "watchlist:check_now", "primary")],
+        [toggle_btn],
+        [btn("🗑️ Clear All", "watchlist:clear_confirm", "danger"), btn("🔙 Main Menu", "nav:home", "primary")]
+    ]
+    if mid:
+        edit(chat, mid, text, kb(rows))
+    else:
+        send(chat, text, kb(rows))
+
+def process_watchlist_add(chat, uid, raw_text):
+    targets = firebase_targets_from_text(raw_text)
+    if not targets:
+        send(chat, "⚠️ Kripya valid Firebase Realtime Database URLs bhejein.")
+        return
+    added, total = add_user_watchlist(uid, targets)
+    session(uid)
+    send(chat, (
+        f"✅ <b>Watchlist Updated!</b>\n\n"
+        f"➕ Added: <b>{added:,}</b> new Firebase URLs\n"
+        f"📌 Total in Watchlist: <b>{total:,} URLs</b>"
+    ), kb([[btn("⏳ Open Watchlist", "menu:watchlist"), btn("🔙 Main Menu", "nav:home")]]))
+
+def process_watchlist_remove(chat, uid, raw_text):
+    targets = firebase_targets_from_text(raw_text)
+    if not targets:
+        send(chat, "⚠️ Kripya remove karne ke liye valid Firebase URLs bhejein.")
+        return
+    removed, total = remove_user_watchlist(uid, targets)
+    session(uid)
+    send(chat, (
+        f"🗑️ <b>Watchlist Updated!</b>\n\n"
+        f"➖ Removed: <b>{removed:,}</b> Firebase URLs\n"
+        f"📌 Remaining in Watchlist: <b>{total:,} URLs</b>"
+    ), kb([[btn("⏳ Open Watchlist", "menu:watchlist"), btn("🔙 Main Menu", "nav:home")]]))
+
+def process_watchlist_check_now(chat, uid):
+    watchlist = get_user_watchlist(uid)
+    if not watchlist:
+        send(chat, "⚠️ <b>Aapki Watchlist empty hai!</b>\nPehle ➕ <b>Add Firebase</b> karke links add karein.", kb([[btn("➕ Add Firebase", "watchlist:add"), btn("🔙 Back", "menu:watchlist")]]))
+        return
+    status_msg = send(chat, f"⏳ <b>Analyzing {len(watchlist)} saved Firebase databases...</b>\nCalculating live status & Death Clock quotas...")
+
+    results = []
+    active_count = 0
+    protected_count = 0
+    dead_count = 0
+    high_risk_count = 0
+
+    with ThreadPoolExecutor(max_workers=min(8, max(2, len(watchlist))), thread_name_prefix="death-clock") as pool:
+        future_map = {pool.submit(check_firebase_death_clock, url): url for url in watchlist}
+        for fut in as_completed(future_map):
+            url = future_map[fut]
+            try:
+                res = fut.result()
+            except Exception:
+                res = {"status": "dead", "risk": "🔴 DEAD", "health": "Error", "lifetime": "Unknown", "keys": 0, "devices": 0}
+            results.append((url, res))
+            st = res.get("status")
+            if st == "active":
+                active_count += 1
+                if "HIGH" in res.get("risk", ""):
+                    high_risk_count += 1
+            elif st == "protected":
+                protected_count += 1
+            else:
+                dead_count += 1
+
+    if status_msg and status_msg.get("message_id"):
+        delete_message(chat, status_msg["message_id"])
+
+    if len(watchlist) <= 10:
+        lines = []
+        for i, (url, res) in enumerate(results, 1):
+            st = res.get("status")
+            st_icon = "🟢 ACTIVE" if st == "active" else ("⚠️ PROTECTED" if st == "protected" else "🔴 DEAD")
+            lines.append(
+                f"{i}. <code>{esc(url)}</code>\n"
+                f"   ├ Status: <b>{st_icon}</b>\n"
+                f"   ├ Health: <i>{esc(res.get('health'))}</i>\n"
+                f"   ├ Quota Risk: <b>{esc(res.get('risk'))}</b>\n"
+                f"   └ Est. Lifetime: <code>{esc(res.get('lifetime'))}</code>"
+            )
+        summary = (
+            f"⚡ <b>LIVE WATCHLIST DEATH CLOCK REPORT</b> ⚡\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Total Checked:</b> <code>{len(watchlist)}</code>\n"
+            f"🟢 <b>Active:</b> <code>{active_count}</code> | ⚠️ <b>Protected:</b> <code>{protected_count}</code> | 🔴 <b>Dead:</b> <code>{dead_count}</code>\n"
+            f"⏳ <b>High Quota Risk:</b> <code>{high_risk_count}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            + "\n\n".join(lines)
+        )
+        send(chat, summary, kb([[btn("🔙 Back to Watchlist", "menu:watchlist")]]))
+    else:
+        temp_dir = tempfile.gettempdir()
+        temp_file = Path(temp_dir) / f"Death_Clock_Report_{int(time.time())}.txt"
+        file_lines = [
+            f"=== FIREBASE WATCHLIST DEATH CLOCK REPORT ===",
+            f"Total Checked: {len(watchlist)} | Active: {active_count} | Protected: {protected_count} | Dead: {dead_count}",
+            f"High Quota Risk: {high_risk_count}\n"
+        ]
+        for i, (url, res) in enumerate(results, 1):
+            st = res.get("status", "dead").upper()
+            file_lines.append(
+                f"[{i}] {url}\n"
+                f"Status: {st} | Health: {res.get('health')} | Quota Risk: {res.get('risk')} | Lifetime: {res.get('lifetime')}\n"
+            )
+        temp_file.write_text("\n".join(file_lines), encoding="utf-8")
+        caption = (
+            f"⚡ <b>LIVE WATCHLIST DEATH CLOCK REPORT</b> ⚡\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Total Checked:</b> <code>{len(watchlist):,}</code>\n"
+            f"🟢 <b>Active:</b> <code>{active_count:,}</code> | ⚠️ <b>Protected:</b> <code>{protected_count:,}</code> | 🔴 <b>Dead:</b> <code>{dead_count:,}</code>\n"
+            f"⏳ <b>High Quota Risk:</b> <code>{high_risk_count:,}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 <i>Detailed Death Clock report attached in file.</i>"
+        )
+        send_document(chat, temp_file, caption=caption)
+        temp_file.unlink(missing_ok=True)
+    gc.collect()
+
+def daily_watchlist_checker_loop():
+    while True:
+        try:
+            time.sleep(60)
+            now_ts = time.time()
+            cursor = []
+            if users is not None:
+                cursor = list(users.find({"daily_alert": True}))
+            else:
+                cursor = [u for u in fallback_users.values() if u.get("daily_alert")]
+
+            for u in cursor:
+                uid = u.get("user_id")
+                if not uid:
+                    continue
+                last_alert = u.get("last_alert_at", 0)
+                if now_ts - last_alert < 86400: # 24 hours
+                    continue
+
+                watchlist = get_user_watchlist(uid)
+                if not watchlist:
+                    continue
+
+                # Check diamond balance
+                diamonds = u.get("diamonds", 0)
+                if diamonds < 1:
+                    set_user_daily_alert(uid, False)
+                    no_bal_msg = (
+                        f"⚠️ <b>Daily Firebase Watchlist Alert Paused!</b>\n\n"
+                        f"Aapke account me Diamonds khatam ho gaye hain.\n"
+                        f"Rozana active status report paane ke liye:\n"
+                        f"👉 <b>Please do refer</b> friends or <b>buy diamond from admin @temp_account_1</b>."
+                    )
+                    try:
+                        send(uid, no_bal_msg, kb([[btn("💎 Buy Diamonds", "menu:buy"), btn("🎁 Refer & Earn", "menu:refer")]]))
+                    except Exception:
+                        pass
+                    continue
+
+                # Deduct 1 diamond
+                update_balance(uid, -1)
+                if users is not None:
+                    users.update_one({"user_id": uid}, {"$set": {"last_alert_at": now_ts}})
+                else:
+                    u["last_alert_at"] = now_ts
+
+                # Check status
+                active_count = 0
+                protected_count = 0
+                dead_count = 0
+                high_risk_count = 0
+
+                for target in watchlist:
+                    res = check_firebase_death_clock(target)
+                    st = res.get("status")
+                    if st == "active":
+                        active_count += 1
+                        if "HIGH" in res.get("risk", ""):
+                            high_risk_count += 1
+                    elif st == "protected":
+                        protected_count += 1
+                    else:
+                        dead_count += 1
+
+                user_rec = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
+                rem_diamonds = (user_rec or {}).get("diamonds", 0)
+
+                report = (
+                    f"🌅 <b>DAILY FIREBASE WATCHLIST REPORT</b> 📊\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>Total Saved:</b> <code>{len(watchlist):,}</code>\n"
+                    f"🟢 <b>Active / Working:</b> <code>{active_count:,}</code>\n"
+                    f"⚠️ <b>Auth Protected:</b> <code>{protected_count:,}</code>\n"
+                    f"🔴 <b>Dead / Deactivated:</b> <code>{dead_count:,}</code>\n"
+                    f"⏳ <b>High Quota Risk:</b> <code>{high_risk_count:,}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💎 <i>1 Diamond deducted for daily status report.</i>\n"
+                    f"Remaining Balance: <b>{rem_diamonds} Diamonds</b>"
+                )
+                try:
+                    send(uid, report, kb([[btn("⏳ Open Watchlist", "menu:watchlist")]]))
+                except Exception:
+                    pass
+                time.sleep(1)
+        except Exception:
+            LOG.exception("Error in daily_watchlist_checker_loop")
+            time.sleep(30)
+
+# ═══════════════════════════════════════════════════════════════
+# DEVELOPER / SISTER APP TRACKER (DNA MATCHER) — ADMIN PRIVATE HIT
+# ═══════════════════════════════════════════════════════════════
+def generate_sister_candidates(target_url):
+    norm = normalize_firebase_url(target_url)
+    if not norm:
+        return []
+    try:
+        parsed = urlparse(norm)
+        host = parsed.netloc.lower()
+    except Exception:
+        return []
+
+    proj_slug = host.split(".")[0]
+    root_name = proj_slug
+    if root_name.endswith("-default-rtdb"):
+        root_name = root_name[:-13]
+
+    candidate_roots = set()
+    candidate_roots.add(root_name)
+
+    suffixes = [
+        "-backup", "-v2", "-v3", "-api", "-dev", "-panel", "-admin",
+        "-test", "-app", "-db", "-live", "-old", "-new"
+    ]
+    for s in suffixes:
+        candidate_roots.add(f"{root_name}{s}")
+
+    match_num = re.search(r"(\d{2,6})$", root_name)
+    if match_num:
+        num_str = match_num.group(1)
+        num_val = int(num_str)
+        prefix = root_name[:match_num.start()]
+        for offset in [-1, 1, 2]:
+            new_num = num_val + offset
+            if new_num > 0:
+                candidate_roots.add(f"{prefix}{new_num}")
+                candidate_roots.add(f"{prefix}{new_num:0{len(num_str)}d}")
+
+    regions = [
+        "firebaseio.com",
+        "asia-southeast1.firebasedatabase.app",
+        "europe-west1.firebasedatabase.app",
+        "us-central1.firebasedatabase.app"
+    ]
+
+    candidates = []
+    for r in candidate_roots:
+        if not r or len(r) < 3 or len(r) > 40:
+            continue
+        for form in [r, f"{r}-default-rtdb"]:
+            for reg in regions:
+                cand_url = f"https://{form}.{reg}"
+                if cand_url != norm:
+                    candidates.append(cand_url)
+
+    return list(dict.fromkeys(candidates))[:80]
+
+def check_sister_candidate(candidate_url):
+    with sister_cache_lock:
+        if candidate_url in sister_tracker_cache:
+            return candidate_url, sister_tracker_cache[candidate_url]
+
+    test_url = f"{candidate_url.rstrip('/')}/.json?shallow=true"
+    req = Request(test_url, headers={"User-Agent": USER_AGENT})
+    res_type = "dead"
+    res_info = None
+    try:
+        with urlopen(req, timeout=3.0) as resp:
+            data = resp.read()
+            payload = json.loads(data.decode("utf-8", errors="ignore"))
+            total_dev = len(payload) if isinstance(payload, dict) else 1
+            res_type = "active"
+            res_info = (candidate_url, total_dev, 0, 0)
+    except HTTPError as err:
+        if err.code in (401, 403):
+            res_type = "protected"
+            res_info = (candidate_url, "Protected By Auth", 0, 0, 0, 0)
+        else:
+            res_type = "dead"
+    except Exception:
+        res_type = "dead"
+
+    with sister_cache_lock:
+        if len(sister_tracker_cache) > 8000:
+            sister_tracker_cache.clear()
+        sister_tracker_cache[candidate_url] = (res_type, res_info)
+
+    return candidate_url, (res_type, res_info)
+
+def process_admin_sister_tracker(chat, uid, raw_input):
+    if not is_admin(uid):
+        send(chat, "❌ Unauthorized.")
+        return
+    with LIMIT_LOCK:
+        if uid in active_sister_users:
+            send(chat, "⚠️ A sister tracking scan is already in progress.")
+            return
+        active_sister_users.add(uid)
+
+    targets = firebase_targets_from_text(raw_input) if isinstance(raw_input, str) else []
+    if not targets:
+        session(uid)
+        with LIMIT_LOCK:
+            active_sister_users.discard(uid)
+        send(chat, "⚠️ No valid Firebase target found. Please send valid Firebase URLs.")
+        return
+
+    status_msg = send(chat, f"🧬 <b>Developer DNA Matcher Active...</b>\nAnalyzing project structures for {len(targets)} target(s)...\n🤫 <i>Discovered sister clones will be delivered privately to you.</i>")
+
+    all_candidates = []
+    for t in targets:
+        all_candidates.extend(generate_sister_candidates(t))
+    all_candidates = list(dict.fromkeys(all_candidates))
+
+    if not all_candidates:
+        session(uid)
+        with LIMIT_LOCK:
+            active_sister_users.discard(uid)
+        if status_msg and status_msg.get("message_id"):
+            delete_message(chat, status_msg["message_id"])
+        send(chat, "ℹ️ No candidate sister patterns generated.")
+        return
+
+    active_hits = []
+    protected_hits = []
+
+    try:
+        # Dedicated 3 workers keeps RAM strictly < 450MB
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sister-worker") as pool:
+            futures = {pool.submit(check_sister_candidate, c): c for c in all_candidates}
+            for fut in as_completed(futures):
+                try:
+                    cand_url, (st, info) = fut.result()
+                    if st == "active":
+                        active_hits.append(cand_url)
+                        devs = info[1] if info and len(info) > 1 else 0
+                        hit_msg = (
+                            f"🎯 <b>[SISTER FIREBASE HIT!]</b> 🧬\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(cand_url)}</code>\n"
+                            f"📌 Status: 🟢 <b>ACTIVE / WORKING</b>\n"
+                            f"📊 Devices: <b>{devs}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🤫 <i>Confidential sister clone discovered. Private to Admin.</i>"
+                        )
+                        send(uid, hit_msg)
+                    elif st == "protected":
+                        protected_hits.append(cand_url)
+                        hit_msg = (
+                            f"🎯 <b>[SISTER FIREBASE HIT!]</b> 🧬\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(cand_url)}</code>\n"
+                            f"📌 Status: ⚠️ <b>PROTECTED BY AUTH</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🤫 <i>Confidential sister clone discovered. Private to Admin.</i>"
+                        )
+                        send(uid, hit_msg)
+                except Exception:
+                    pass
+
+        active_hits = list(dict.fromkeys(active_hits))
+        protected_hits = list(dict.fromkeys(protected_hits))
+        total_hits = len(active_hits) + len(protected_hits)
+
+        if total_hits == 0:
+            send(chat, f"ℹ️ <b>Sister DB Scan Complete:</b>\nScanned <code>{len(all_candidates):,}</code> candidate endpoints across {len(targets)} target(s).\nNo active sister databases discovered.", kb([[btn("🔙 Back to Admin", "admin:panel")]]))
+        elif total_hits <= 10:
+            summary = (
+                f"✅ <b>Sister DB Scan Completed!</b>\n\n"
+                f"🎯 Total Hits Discovered: <b>{total_hits}</b>\n"
+                f"🟢 Active: <b>{len(active_hits)}</b> | ⚠️ Protected: <b>{len(protected_hits)}</b>\n\n"
+                f"All individual confidential HIT messages have been delivered above to your private chat!"
+            )
+            send(chat, summary, kb([[btn("🔙 Back to Admin", "admin:panel")]]))
+        else:
+            temp_dir = tempfile.gettempdir()
+            temp_file = Path(temp_dir) / f"Secret_Sister_Hits_{int(time.time())}.txt"
+            content_txt = "=== ACTIVE SISTER DATABASES ===\n" + "\n".join(active_hits) + "\n\n=== PROTECTED SISTER DATABASES ===\n" + "\n".join(protected_hits)
+            temp_file.write_text(content_txt, encoding="utf-8")
+            caption = (
+                f"🎯 <b>[SECRET SISTER FIREBASE HITS]</b> 🧬\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 Targets Tested: <code>{len(targets)}</code>\n"
+                f"⚡ Endpoints Scanned: <code>{len(all_candidates):,}</code>\n"
+                f"🟢 Active Hits: <code>{len(active_hits):,}</code>\n"
+                f"⚠️ Protected Hits: <code>{len(protected_hits):,}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤫 <i>Full private list attached in document.</i>"
+            )
+            send_document(uid, temp_file, caption=caption)
+            temp_file.unlink(missing_ok=True)
+
+        if active_hits:
+            send_to_dump_channel(uid, active_hits, "sister_tracker")
+
+    finally:
+        session(uid)
+        with LIMIT_LOCK:
+            active_sister_users.discard(uid)
+        if status_msg and status_msg.get("message_id"):
+            delete_message(chat, status_msg["message_id"])
+        gc.collect()
+
 
 # ═══════════════════════════════════════════════════════════════
 # EXTRACTION WORKFLOW WITH REFUND & DUMP CHANNELS
@@ -2158,16 +2735,8 @@ def process_extraction(message):
             send(chat, "⚠️ <b>Scan Complete:</b> No Firebase database URL found. No diamond was used.")
             return
 
-        cost = cost_per_link * billable_inputs
-        u = users.find_one({"user_id": uid}) if users is not None else fallback_user(uid)
-        if u.get("diamonds", 0) < cost:
-            send(chat, f"❌ <b>Insufficient Balance!</b> You need 💎 {format_diamonds(cost)} Diamonds for {billable_inputs or len(urls)} link(s).", main_menu(uid))
-            return
-
-        # Scan first, then charge only for source links that produced a real
-        # Firebase endpoint. A failed/empty scan is never billed.
-        update_balance(uid, -cost)
-        charged_cost = cost
+        cost = 0
+        charged_cost = 0
 
         urls = clean_firebase_url_list(urls)
         new_urls = save_extract(uid, urls, source)
@@ -2182,42 +2751,18 @@ def process_extraction(message):
                     f"🔥 <b>Extraction {index}/{len(inputs)} Successful!</b>\n\n"
                     f"<b>Input:</b> <code>{esc(label[:180])}</code>\n"
                     f"<b>Found Databases ({len(clean_found)}):</b>\n{lines}\n\n"
-                    f"💎 <b>Credit used:</b> <code>{format_diamonds(cost_per_link)}</code> Diamond"
+                    f"💎 <b>Credit used:</b> <code>0 (Free)</code>"
                 )
             else:
-                send(chat, f"⚠️ <b>Extraction {index}/{len(inputs)}:</b> No Firebase URL found.\n<b>Input:</b> <code>{esc(label[:180])}</code>\n\n💎 <b>Credit used:</b> <code>0</code> Diamond")
+                send(chat, f"⚠️ <b>Extraction {index}/{len(inputs)}:</b> No Firebase URL found.\n<b>Input:</b> <code>{esc(label[:180])}</code>\n\n💎 <b>Credit used:</b> <code>0 (Free)</code>")
 
         send_completion_summary(chat, "Extraction", urls, cost, billable_inputs or len(urls))
 
         send_to_dump_channel(uid, new_urls, source)
-        lines = "\n".join(f"{i}. <code>{esc(u_url)}</code>" for i, u_url in enumerate(urls[:30], 1))
-
-        # Keep the legacy destination only until a custom dump channel is configured.
-        if not dump_channel_config()[0] and USER_DUMP_CHANNEL:
-            try:
-                dump_msg = f"🔥 <b>New Firebase Extracted ({source.upper()})</b>\n\n<b>Databases ({len(urls)}):</b>\n{lines}"
-                tg("sendMessage", {"chat_id": USER_DUMP_CHANNEL, "text": dump_msg[:4090], "parse_mode": "HTML"})
-            except Exception: pass
-
-        # Dump to Admin Private Channel
-        try:
-            new_lines = "\n".join(f"{i}. <code>{esc(u_url)}</code>" for i, u_url in enumerate(new_urls[:30], 1))
-            admin_dump = (f"🚨 <b>[EXTRACTION LOG]</b>\n\n"
-                          f"👤 User: {esc(uname(u))}\n"
-                          f"🆔 ID: <code>{uid}</code>\n"
-                          f"📂 Source: <b>{source.upper()}</b>\n"
-                          f"🎯 New Firebase ({len(new_urls)}):\n{new_lines}")
-            if ADMIN_DUMP_CHANNEL and new_urls:
-                tg("sendMessage", {"chat_id": ADMIN_DUMP_CHANNEL, "text": admin_dump[:4090], "parse_mode": "HTML"})
-        except Exception: pass
 
     except Exception as exc:
         LOG.exception("Extract error")
-        # Automatic Refund Logic on error
-        if charged_cost:
-            update_balance(uid, charged_cost)
-        refund_text = f"\n🔄 💎 <b>{format_diamonds(charged_cost)} Diamond Refunded</b>." if charged_cost else ""
-        send(chat, f"❌ <b>Extraction Error:</b> <code>{esc(str(exc)[:200])}</code>{refund_text}", main_menu(uid))
+        send(chat, f"❌ <b>Extraction Error:</b> <code>{esc(str(exc)[:200])}</code>", main_menu(uid))
     finally:
         if status_msg and status_msg.get("message_id"):
             delete_message(chat, status_msg["message_id"])
@@ -2233,7 +2778,6 @@ def process_extraction(message):
         session(uid)
         gc.collect()
     another_task_prompt(chat)
-    drain_user_task_queue(uid)
 
 # ═══════════════════════════════════════════════════════════════
 # ORDERS & PAYMENT SYSTEM
@@ -2261,7 +2805,7 @@ def create_order(chat, uid, amount):
 # ═══════════════════════════════════════════════════════════════
 def admin_panel(chat, mid=None):
     rows = [[btn("📡 Channels", "admin:channels"), btn("📥 Dump", "admin:dump")],
-            [btn("👮 Admins", "admin:admins")],
+            [btn("👮 Admins", "admin:admins"), btn("🧬 Sister DB Tracker", "admin:sister_tracker")],
             [btn("🛎️ Orders", "admin:orders"), btn("🌐 History", "admin:history")],
             [btn("💎 Diamonds", "admin:diamond"), btn("🎁 Bonuses", "admin:bonuses")],
             [btn("🚫 Ban User", "admin:ban"), btn("✅ Unban User", "admin:unban")],
@@ -2297,6 +2841,9 @@ def admin_dump_channel(chat, mid=None):
 
 def handle_admin_input(message, state, text):
     uid, chat = message["from"]["id"], message["chat"]["id"]; action = state.get("action") if isinstance(state, dict) else state
+    if action == "admin_sister_tracker":
+        submit_work(process_admin_sister_tracker, chat, uid, text)
+        return True
     if action == "viewer_sticker":
         sticker = message.get("sticker")
         if not sticker:
@@ -2491,35 +3038,6 @@ def drain_apk_queue(uid):
             with LIMIT_LOCK:
                 apk_queue_workers.discard(uid)
 
-def queue_user_task(uid, chat, task_fn, msg_payload, task_name="Task"):
-    """Queue a task for the user if another process is currently running."""
-    with LIMIT_LOCK:
-        queue = user_task_queues.setdefault(uid, [])
-        if len(queue) >= 10:
-            send(chat, "⏳ Aapki task queue full hai (Max 10). Kripya purane tasks poore hone ka intezaar karein.")
-            return False
-        queue.append((task_fn, msg_payload, task_name))
-        q_pos = len(queue)
-    
-    send(chat, f"⏳ <b>A process is running, after finishing that progress I will start this.</b>\n\n📌 Task: <b>{task_name}</b> (Queue Position: #{q_pos})")
-    return True
-
-def drain_user_task_queue(uid):
-    """Run the next queued task for this user as soon as the active process finishes."""
-    next_task = None
-    with LIMIT_LOCK:
-        queue = user_task_queues.get(uid, [])
-        if queue:
-            next_task = queue.pop(0)
-            if not queue:
-                user_task_queues.pop(uid, None)
-    
-    if next_task:
-        task_fn, msg_payload, task_name = next_task
-        LOG.info("Starting queued task '%s' for user %s", task_name, uid)
-        submit_work(task_fn, msg_payload)
-
-
 # ═══════════════════════════════════════════════════════════════
 # CALLBACK QUERY ROUTING
 # ═══════════════════════════════════════════════════════════════
@@ -2585,6 +3103,55 @@ def callback(q):
             cancel_extract_timeout(uid)
             session(uid)
             welcome(chat, uid, mid)
+        elif action == "watchlist":
+            if value == "dashboard":
+                show_watchlist_dashboard(chat, uid, mid)
+            elif value == "add":
+                session(uid, {"action": "watchlist_add"})
+                edit(chat, mid,
+                    "➕ <b>Add Firebase to Watchlist</b>\n\n"
+                    "Apne ek ya multiple Firebase URLs bhejein ya <b>.txt</b> file upload karein.\n"
+                    "Bot inhe aapki personal Watchlist me save karega aur daily report me monitor karega.",
+                    kb([[btn("🔙 Back to Watchlist", "watchlist:dashboard")]]))
+            elif value == "remove":
+                session(uid, {"action": "watchlist_remove"})
+                edit(chat, mid,
+                    "➖ <b>Remove Firebase from Watchlist</b>\n\n"
+                    "Jo Firebase URL remove karna hai wo bhejein (single ya multiple lines).",
+                    kb([[btn("🔙 Back to Watchlist", "watchlist:dashboard")]]))
+            elif value == "view":
+                watchlist = get_user_watchlist(uid)
+                if not watchlist:
+                    edit(chat, mid, "📋 <b>Your Saved Watchlist</b>\n\n⚠️ Watchlist abhi empty hai.", kb([[btn("➕ Add Firebase", "watchlist:add"), btn("🔙 Back", "watchlist:dashboard")]]))
+                elif len(watchlist) <= 10:
+                    lines = "\n".join(f"{i}. <code>{esc(u)}</code>" for i, u in enumerate(watchlist, 1))
+                    edit(chat, mid, f"📋 <b>Your Saved Watchlist ({len(watchlist)})</b>\n\n{lines}", kb([[btn("➕ Add Firebase", "watchlist:add"), btn("➖ Remove", "watchlist:remove")], [btn("🔙 Back", "watchlist:dashboard")]]))
+                else:
+                    temp_dir = tempfile.gettempdir()
+                    temp_file = Path(temp_dir) / f"My_Firebase_Watchlist_{int(time.time())}.txt"
+                    temp_file.write_text("\n".join(watchlist), encoding="utf-8")
+                    send_document(chat, temp_file, caption=f"📋 <b>Your Saved Firebase Watchlist ({len(watchlist):,} URLs)</b>")
+                    temp_file.unlink(missing_ok=True)
+                    show_watchlist_dashboard(chat, uid)
+            elif value == "clear_confirm":
+                edit(chat, mid, "⚠️ <b>Are you sure?</b>\n\nKya aap apni Watchlist ke saare Firebase URLs delete karna chahte hain?",
+                     kb([[btn("✅ Yes, Clear All", "watchlist:clear_do", "danger")], [btn("❌ Cancel", "watchlist:dashboard")]]))
+            elif value == "clear_do":
+                clear_user_watchlist(uid)
+                answer(q, "✅ Watchlist cleared!")
+                show_watchlist_dashboard(chat, uid, mid)
+            elif value == "toggle":
+                sub_val = data[2] if len(data) > 2 else "off"
+                if sub_val == "on":
+                    set_user_daily_alert(uid, True)
+                    answer(q, "🔔 Daily Report Activated (💎1/Day)!")
+                else:
+                    set_user_daily_alert(uid, False)
+                    answer(q, "🔕 Daily Report Paused (Free)!")
+                show_watchlist_dashboard(chat, uid, mid)
+            elif value == "check_now":
+                submit_work(process_watchlist_check_now, chat, uid)
+                answer(q, "⏳ Analyzing Death Clock...")
         elif action == "menu":
             if value == "extract":
                 if is_process_running(uid):
@@ -2602,12 +3169,14 @@ def callback(q):
                 started_at = time.time()
                 session(uid, {"action": "extract", "message_id": prompt_id, "started_at": started_at})
                 schedule_extract_timeout(chat, uid, prompt_id, started_at)
+            elif value == "watchlist":
+                show_watchlist_dashboard(chat, uid, mid)
             elif value == "viewer":
                 if is_process_running(uid):
                     answer(q, "⚠️ A process is currently running. Please let it finish first.", alert=True)
                     return
                 session(uid, {"action": "firebase_view"})
-                edit(chat, mid, "📊 <b>Firebase Viewer</b>\n\nSend one or more Firebase Realtime Database URLs, a Base64-wrapped URL, or a .txt file.\n\n💎 Cost: <b>0.5 Diamond</b>", kb([[btn("❌ Cancel", "nav:home")]]))
+                edit(chat, mid, "📊 <b>Firebase Viewer</b>\n\nSend one or more Firebase Realtime Database URLs, a Base64-wrapped URL, or a .txt file.\n\n✨ <b>100% Free — Unlimited Checks</b>", kb([[btn("❌ Cancel", "nav:home")]]))
             elif value == "dedup":
                 if is_process_running(uid):
                     answer(q, "⚠️ A process is currently running. Please let it finish first.", alert=True)
@@ -2691,6 +3260,16 @@ def callback(q):
             elif value == "dump": admin_dump_channel(chat,mid)
             elif value == "set_dump": session(uid, {"action": "dump_channel"}); edit(chat, mid, "📥 <b>Set Dump Channel</b>\n\nForward any message from the target channel here, or send its numeric ID.\n\nBot ko channel me message bhejne ki permission honi chahiye.", kb([[btn("🔙 Back", "admin:dump")]]))
             elif value == "add_channel": session(uid,{"action":"add_channel"}); edit(chat,mid,"📩 Forward any message from the private/public channel or group here.",kb([[btn("🔙 Back","admin:channels")]]))
+            elif value == "sister_tracker":
+                session(uid, {"action": "admin_sister_tracker"})
+                edit(chat, mid,
+                    "🧬 <b>Developer / Sister App Tracker (DNA Matcher)</b>\n\n"
+                    "Ek ya multiple Firebase URLs bhejein (ya <b>.txt</b> file).\n\n"
+                    "Bot developer ke project naming DNA, suffix variants (<code>-backup</code>, <code>-v2</code>, <code>-dev</code>, <code>-api</code>, <code>-panel</code>), "
+                    "sequence numbers, aur regional clusters ko scan karke undiscovered sister databases find karega!\n\n"
+                    "🤫 <i>Discovered hits will be sent privately to your DM.</i>\n"
+                    "⚙️ <i>Dedicated 3 workers & Smart LRU Cache active (RAM < 450MB).</i>",
+                    kb([[btn("🔙 Back", "admin:panel")]]))
             elif value == "admins":
                 a = list(admins.find().sort("user_id",1)) if admins is not None else [{"user_id": x} for x in sorted(ADMIN_IDS | fallback_admins)]
                 edit(chat,mid,"👮 <b>Admin List</b>\n\n"+("\n".join(f"• <code>{x['user_id']}</code>" for x in a) or "None"),kb([[btn("➕ Add Admin","admin:add_admin"),btn("➖ Remove Admin","admin:remove_admin")],[btn("🔙 Back","admin:panel")]]))
@@ -2787,10 +3366,21 @@ def handle_message(msg_obj):
             path = None
             try:
                 path = download(doc["file_id"])
+                if state_action == "watchlist_add":
+                    text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
+                    process_watchlist_add(chat, uid, text_content)
+                    return
+                if state_action == "watchlist_remove":
+                    text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
+                    process_watchlist_remove(chat, uid, text_content)
+                    return
+                if is_admin(uid) and state_action == "admin_sister_tracker":
+                    text_content = path.read_text(encoding="utf-8", errors="ignore")[:MAX_VIEWER_SCAN]
+                    submit_work(process_admin_sister_tracker, chat, uid, text_content)
+                    return
                 if state_action == "dedup":
                     if is_process_running(uid):
-                        queue_user_task(uid, chat, process_dedup_file, {**msg_obj, "downloaded_path": str(path), "doc_name": doc.get("file_name", "data.txt")}, "Deduplication (.txt)")
-                        path = None
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
                         return
                     submit_work(
                         process_dedup_file,
@@ -2802,13 +3392,13 @@ def handle_message(msg_obj):
                 targets = firebase_targets_from_text(text_content)
                 if targets or state_action == "firebase_view":
                     if is_process_running(uid):
-                        queue_user_task(uid, chat, process_firebase_view, {**msg_obj, "text": text_content, "is_txt_file": True}, "Firebase Viewer (.txt)")
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
                         return
-                    submit_work(process_firebase_view, {**msg_obj, "text": text_content, "is_txt_file": True})
+                    submit_work(process_firebase_view, {**msg_obj, "text": text_content})
                     return
                 elif state_action == "extract":
                     if is_process_running(uid):
-                        queue_user_task(uid, chat, process_extraction, msg_obj, "Extraction (.txt)")
+                        send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
                         return
                     submit_work(process_extraction, msg_obj)
                     return
@@ -2827,28 +3417,40 @@ def handle_message(msg_obj):
     if is_admin(uid) and state and handle_admin_input(msg_obj, state, text): return
 
     if state_action == "extract":
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
         if not looks_like_url(text):
             send(chat, "⚠️ Please send an APK file or a valid public web/Firebase URL.")
-            return
-        if is_process_running(uid):
-            queue_user_task(uid, chat, process_extraction, msg_obj, "Extraction (URL)")
             return
         submit_work(process_extraction, msg_obj)
         return
 
     if state_action == "firebase_view":
+        if is_process_running(uid):
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
+            return
         if not firebase_targets_from_text(text):
             send(chat, "⚠️ Please send a valid Firebase Realtime Database URL.")
-            return
-        if is_process_running(uid):
-            queue_user_task(uid, chat, process_firebase_view, msg_obj, "Firebase Viewer")
             return
         submit_work(process_firebase_view, msg_obj)
         return
 
+    if state_action == "watchlist_add":
+        process_watchlist_add(chat, uid, text)
+        return
+
+    if state_action == "watchlist_remove":
+        process_watchlist_remove(chat, uid, text)
+        return
+
+    if is_admin(uid) and state_action == "admin_sister_tracker":
+        submit_work(process_admin_sister_tracker, chat, uid, text)
+        return
+
     if state_action == "dedup":
         if is_process_running(uid):
-            queue_user_task(uid, chat, process_dedup_text, msg_obj, "Deduplication (Text)")
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
             return
         submit_work(process_dedup_text, msg_obj)
         return
@@ -2856,7 +3458,7 @@ def handle_message(msg_obj):
     # Auto-detection: If user directly sends Firebase URL(s) without menu, check them immediately
     if firebase_targets_from_text(text):
         if is_process_running(uid):
-            queue_user_task(uid, chat, process_firebase_view, msg_obj, "Firebase Viewer (Auto)")
+            send(chat, "⚠️ <b>A process is currently running. Please let it finish first.</b>")
             return
         submit_work(process_firebase_view, msg_obj)
         return
@@ -2982,6 +3584,7 @@ def main():
     setup_db(); BOT_USERNAME = (tg("getMe") or {}).get("username","your_bot")
     threading.Thread(target=backup_loop, daemon=True, name="mongodb-backup").start()
     threading.Thread(target=self_ping_loop, daemon=True, name="self-keepalive").start()
+    threading.Thread(target=daily_watchlist_checker_loop, daemon=True, name="daily-watchlist-worker").start()
     
     port = int(os.getenv("PORT", "8099"))
     try:
@@ -2991,12 +3594,6 @@ def main():
     except OSError as exc:
         LOG.warning("Health server could not bind port %s: %s. Continuing with Telegram bot.", port, exc)
     tg("deleteWebhook",{"drop_pending_updates":False})
-    try:
-        tg("setMyDescription", {"description": "By @Scripter_Shadow"})
-        tg("setMyShortDescription", {"short_description": "By @Scripter_Shadow"})
-        LOG.info("Updated Telegram bot description and short description to 'By @Scripter_Shadow'")
-    except Exception as exc:
-        LOG.warning("Could not set Telegram bot description: %s", exc)
     LOG.info("⚡ Bot live as @%s", BOT_USERNAME)
     threading.Thread(target=bot_watchdog, daemon=True, name="bot-watchdog").start()
     
