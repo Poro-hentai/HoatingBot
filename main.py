@@ -3268,7 +3268,7 @@ def callback(q):
                     "Bot developer ke project naming DNA, suffix variants (<code>-backup</code>, <code>-v2</code>, <code>-dev</code>, <code>-api</code>, <code>-panel</code>), "
                     "sequence numbers, aur regional clusters ko scan karke undiscovered sister databases find karega!\n\n"
                     "🤫 <i>Discovered hits will be sent privately to your DM.</i>\n"
-                    "⚙️ <i>Dedicated 3 workers & Smart LRU Cache active (RAM < 450MB).</i>",
+                    "⚙️ <i>Dedicated 3 workers & Smart LRU Cache active (under 450MB RAM).</i>",
                     kb([[btn("🔙 Back", "admin:panel")]]))
             elif value == "admins":
                 a = list(admins.find().sort("user_id",1)) if admins is not None else [{"user_id": x} for x in sorted(ADMIN_IDS | fallback_admins)]
