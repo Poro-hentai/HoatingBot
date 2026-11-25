@@ -42,6 +42,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 LOG = logging.getLogger("firebase-bot")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo").strip()
+if TOKEN == "8216354175:AAH_pilA68YbcWAE1vgXcwmlZK92loHaJvU" or not TOKEN:
+    TOKEN = "8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo"
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb+srv://Tokishaki:Shadow123@cluster0.2dtvfy1.mongodb.net/?appName=Cluster0").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_ID", "5759232282").split(",") if x.strip().isdigit()}
 SUPPORT_URL = os.getenv("SUPPORT_GROUP_URL", "https://t.me/+bOhnrl3FeJk5ODll").strip()
@@ -2296,7 +2298,7 @@ def show_watchlist_dashboard(chat, uid, mid=None):
     alert_status = "🟢 <b>Active (💎1/Day)</b>" if daily_alert else "🔕 <b>Paused (Free)</b>"
 
     text = (
-        f"⏳ <b>FIREBASE WATCHLIST & DEATH CLOCK</b>\n"
+        f"⏳ <b>FIREBASE WATCHLIST &amp; DEATH CLOCK</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>Saved Databases:</b> <code>{len(watchlist):,} URLs</code>\n"
         f"🔔 <b>Daily Status Report:</b> {alert_status}\n"
@@ -2525,60 +2527,101 @@ def daily_watchlist_checker_loop():
 # ═══════════════════════════════════════════════════════════════
 # DEVELOPER / SISTER APP TRACKER (DNA MATCHER) — ADMIN PRIVATE HIT
 # ═══════════════════════════════════════════════════════════════
+def extract_project_dna(target_url):
+    norm = normalize_firebase_url(target_url)
+    if not norm:
+        return "", "plain", None
+    try:
+        host = urlparse(norm).netloc.lower()
+    except Exception:
+        return "", "plain", None
+    proj = host.split(".")[0].replace("-default-rtdb", "")
+    m_hex = re.match(r"^(.+?)[-_]([0-9a-f]{5})$", proj)
+    if m_hex:
+        return m_hex.group(1), "hex", m_hex.group(2)
+    m_num = re.match(r"^(.+?)[-_]?(\d+)$", proj)
+    if m_num:
+        return m_num.group(1), "num", int(m_num.group(2))
+    return proj, "plain", None
+
+def find_inventory_sisters(base_name, exclude_urls=None):
+    if not base_name or len(base_name) < 3:
+        return []
+    exclude_set = set(u.strip().rstrip("/") for u in (exclude_urls or []))
+    found = []
+
+    # 1. working_online_firebase.txt on desktop
+    txt_path = Path(r"C:\Users\AAKASH\OneDrive\Desktop\firebase\working_online_firebase.txt")
+    if txt_path.exists():
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    u = line.strip().rstrip("/")
+                    if not u or u in exclude_set:
+                        continue
+                    try:
+                        host = urlparse(u).netloc.lower()
+                        proj = host.split(".")[0].replace("-default-rtdb", "")
+                        if proj.startswith(base_name + "-") or proj.startswith(base_name + "_") or proj == base_name:
+                            found.append(u)
+                        elif base_name in proj and len(base_name) >= 4:
+                            found.append(u)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # 2. Database events/history if available
+    try:
+        if events is not None:
+            cursor = events.find({"url": {"$regex": re.escape(base_name), "$options": "i"}}, {"url": 1}).limit(50)
+            for doc in cursor:
+                u = (doc.get("url") or "").strip().rstrip("/")
+                if u and u not in exclude_set and u not in found:
+                    found.append(u)
+    except Exception:
+        pass
+
+    return list(dict.fromkeys(found))[:30]
+
 def generate_sister_candidates(target_url):
     norm = normalize_firebase_url(target_url)
     if not norm:
         return []
-    try:
-        parsed = urlparse(norm)
-        host = parsed.netloc.lower()
-    except Exception:
+    base_name, kind, extra = extract_project_dna(target_url)
+    if not base_name or len(base_name) < 2:
         return []
 
-    proj_slug = host.split(".")[0]
-    root_name = proj_slug
-    if root_name.endswith("-default-rtdb"):
-        root_name = root_name[:-13]
+    cands = set()
+    regions = ["firebaseio.com", "asia-southeast1.firebasedatabase.app"]
 
-    candidate_roots = set()
-    candidate_roots.add(root_name)
+    if kind == "num" and isinstance(extra, int):
+        num = extra
+        seqs = [num - 2, num - 1, num + 1, num + 2, num + 3, num + 4, num + 5, 1, 2, 3, 4, 5, 10, 11]
+        for n in seqs:
+            if n <= 0:
+                continue
+            for form in [f"{base_name}-{n}", f"{base_name}{n}", f"{base_name}-{n:02d}"]:
+                for r in regions:
+                    cands.add(f"https://{form}-default-rtdb.{r}")
+                    cands.add(f"https://{form}.{r}")
+    else:
+        # Common numbers
+        for n in range(1, 11):
+            for form in [f"{base_name}-{n}", f"{base_name}{n}"]:
+                for r in regions:
+                    cands.add(f"https://{form}-default-rtdb.{r}")
+        # Common panel / scam app prefixes & suffixes
+        for w in ["panel", "admin", "app", "sms", "otp", "live", "call", "bot", "v2", "v3"]:
+            for form in [f"{base_name}-{w}", f"{base_name}{w}"]:
+                for r in regions:
+                    cands.add(f"https://{form}-default-rtdb.{r}")
+        for r in regions:
+            cands.add(f"https://{base_name}-default-rtdb.{r}")
+            cands.add(f"https://{base_name}.{r}")
 
-    suffixes = [
-        "-backup", "-v2", "-v3", "-api", "-dev", "-panel", "-admin",
-        "-test", "-app", "-db", "-live", "-old", "-new"
-    ]
-    for s in suffixes:
-        candidate_roots.add(f"{root_name}{s}")
-
-    match_num = re.search(r"(\d{2,6})$", root_name)
-    if match_num:
-        num_str = match_num.group(1)
-        num_val = int(num_str)
-        prefix = root_name[:match_num.start()]
-        for offset in [-1, 1, 2]:
-            new_num = num_val + offset
-            if new_num > 0:
-                candidate_roots.add(f"{prefix}{new_num}")
-                candidate_roots.add(f"{prefix}{new_num:0{len(num_str)}d}")
-
-    regions = [
-        "firebaseio.com",
-        "asia-southeast1.firebasedatabase.app",
-        "europe-west1.firebasedatabase.app",
-        "us-central1.firebasedatabase.app"
-    ]
-
-    candidates = []
-    for r in candidate_roots:
-        if not r or len(r) < 3 or len(r) > 40:
-            continue
-        for form in [r, f"{r}-default-rtdb"]:
-            for reg in regions:
-                cand_url = f"https://{form}.{reg}"
-                if cand_url != norm:
-                    candidates.append(cand_url)
-
-    return list(dict.fromkeys(candidates))[:80]
+    norm_target = norm.rstrip("/")
+    return [c for c in list(cands) if c.rstrip("/") != norm_target][:80]
 
 def check_sister_candidate(candidate_url):
     with sister_cache_lock:
@@ -2586,20 +2629,31 @@ def check_sister_candidate(candidate_url):
             return candidate_url, sister_tracker_cache[candidate_url]
 
     test_url = f"{candidate_url.rstrip('/')}/.json?shallow=true"
-    req = Request(test_url, headers={"User-Agent": USER_AGENT})
+    headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close", "Accept": "application/json"}
+    req = Request(test_url, headers=headers)
     res_type = "dead"
-    res_info = None
+    res_info = (candidate_url, 0, 0, 0)
     try:
         with urlopen(req, timeout=3.0) as resp:
-            data = resp.read()
-            payload = json.loads(data.decode("utf-8", errors="ignore"))
-            total_dev = len(payload) if isinstance(payload, dict) else 1
+            data = resp.read(65536)
+            payload = json.loads(data.decode("utf-8", errors="ignore")) if data else None
+            tot = 0
+            on = 0
+            off = 0
+            if isinstance(payload, dict):
+                try:
+                    tot, on, off, _ = read_firebase_status(candidate_url)
+                except Exception:
+                    tot = len(payload)
             res_type = "active"
-            res_info = (candidate_url, total_dev, 0, 0)
+            res_info = (candidate_url, tot, on, off)
     except HTTPError as err:
         if err.code in (401, 403):
             res_type = "protected"
-            res_info = (candidate_url, "Protected By Auth", 0, 0, 0, 0)
+            res_info = (candidate_url, "Protected By Auth", 0, 0)
+        elif err.code in (402, 423):
+            res_type = "quota_active"
+            res_info = (candidate_url, "Quota Exceeded (Live Active Project)", 0, 0)
         else:
             res_type = "dead"
     except Exception:
@@ -2633,9 +2687,15 @@ def process_admin_sister_tracker(chat, uid, raw_input):
     status_msg = send(chat, f"🧬 <b>Developer DNA Matcher Active...</b>\nAnalyzing project structures for {len(targets)} target(s)...\n🤫 <i>Discovered sister clones will be delivered privately to you.</i>")
 
     all_candidates = []
+    # Step 1: Collect from bot's known inventory
+    inventory_matches = []
     for t in targets:
+        base_name, _, _ = extract_project_dna(t)
+        inventory_matches.extend(find_inventory_sisters(base_name, targets))
         all_candidates.extend(generate_sister_candidates(t))
-    all_candidates = list(dict.fromkeys(all_candidates))
+
+    inventory_matches = list(dict.fromkeys(inventory_matches))
+    all_candidates = list(dict.fromkeys(inventory_matches + all_candidates))
 
     if not all_candidates:
         session(uid)
@@ -2658,17 +2718,19 @@ def process_admin_sister_tracker(chat, uid, raw_input):
                     cand_url, (st, info) = fut.result()
                     if st == "active":
                         active_hits.append(cand_url)
-                        devs = info[1] if info and len(info) > 1 else 0
+                        tot_dev = info[1] if info and len(info) > 1 and isinstance(info[1], int) else 0
+                        on_dev = info[2] if info and len(info) > 2 and isinstance(info[2], int) else 0
+                        off_dev = info[3] if info and len(info) > 3 and isinstance(info[3], int) else 0
                         hit_msg = (
                             f"🎯 <b>[SISTER FIREBASE HIT!]</b> 🧬\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🔗 <code>{esc(cand_url)}</code>\n"
                             f"📌 Status: 🟢 <b>ACTIVE / WORKING</b>\n"
-                            f"📊 Devices: <b>{devs}</b>\n"
+                            f"📊 Total Devices: <b>{tot_dev}</b> | 🟢 Online: <b>{on_dev}</b> | 🔴 Offline: <b>{off_dev}</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🤫 <i>Confidential sister clone discovered. Private to Admin.</i>"
                         )
-                        send(uid, hit_msg)
+                        send(chat, hit_msg)
                     elif st == "protected":
                         protected_hits.append(cand_url)
                         hit_msg = (
@@ -2679,7 +2741,18 @@ def process_admin_sister_tracker(chat, uid, raw_input):
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🤫 <i>Confidential sister clone discovered. Private to Admin.</i>"
                         )
-                        send(uid, hit_msg)
+                        send(chat, hit_msg)
+                    elif st == "quota_active":
+                        active_hits.append(cand_url)
+                        hit_msg = (
+                            f"🎯 <b>[SISTER FIREBASE HIT!]</b> 🧬\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔗 <code>{esc(cand_url)}</code>\n"
+                            f"📌 Status: 🟡 <b>ACTIVE / QUOTA EXCEEDED</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🤫 <i>Confidential sister clone discovered. Private to Admin.</i>"
+                        )
+                        send(chat, hit_msg)
                 except Exception:
                     pass
 
@@ -2712,11 +2785,14 @@ def process_admin_sister_tracker(chat, uid, raw_input):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🤫 <i>Full private list attached in document.</i>"
             )
-            send_document(uid, temp_file, caption=caption)
+            send_document(chat, temp_file, caption=caption)
             temp_file.unlink(missing_ok=True)
 
         if active_hits:
-            send_to_dump_channel(uid, active_hits, "sister_tracker")
+            try:
+                WORKERS.submit(send_to_dump_channel, uid, active_hits, "sister_tracker")
+            except Exception:
+                pass
 
     finally:
         session(uid)
@@ -3369,7 +3445,7 @@ def callback(q):
                     "Bot developer ke project naming DNA, suffix variants (<code>-backup</code>, <code>-v2</code>, <code>-dev</code>, <code>-api</code>, <code>-panel</code>), "
                     "sequence numbers, aur regional clusters ko scan karke undiscovered sister databases find karega!\n\n"
                     "🤫 <i>Discovered hits will be sent privately to your DM.</i>\n"
-                    "⚙️ <i>Dedicated 3 workers & Smart LRU Cache active (under 450MB RAM).</i>",
+                    "⚙️ <i>Dedicated 3 workers and Smart LRU Cache active (under 450MB RAM).</i>",
                     kb([[btn("🔙 Back", "admin:panel")]]))
             elif value == "admins":
                 a = list(admins.find().sort("user_id",1)) if admins is not None else [{"user_id": x} for x in sorted(ADMIN_IDS | fallback_admins)]
@@ -3680,13 +3756,7 @@ def bot_watchdog():
 
 
 def main():
-    global BOT_USERNAME
-    if not TOKEN: LOG.error("Configure TELEGRAM_BOT_TOKEN in environment variables."); return
-    setup_db(); BOT_USERNAME = (tg("getMe") or {}).get("username","your_bot")
-    threading.Thread(target=backup_loop, daemon=True, name="mongodb-backup").start()
-    threading.Thread(target=self_ping_loop, daemon=True, name="self-keepalive").start()
-    threading.Thread(target=daily_watchlist_checker_loop, daemon=True, name="daily-watchlist-worker").start()
-    
+    global BOT_USERNAME, TOKEN, API
     port = int(os.getenv("PORT", "8099"))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", port), Health)
@@ -3694,7 +3764,33 @@ def main():
         LOG.info("Health server listening on port %s", port)
     except OSError as exc:
         LOG.warning("Health server could not bind port %s: %s. Continuing with Telegram bot.", port, exc)
-    tg("deleteWebhook",{"drop_pending_updates":False})
+
+    if not TOKEN:
+        LOG.error("Configure TELEGRAM_BOT_TOKEN in environment variables.")
+        return
+
+    setup_db()
+    try:
+        BOT_USERNAME = (tg("getMe") or {}).get("username", "your_bot")
+    except Exception as exc:
+        LOG.error("Failed to fetch getMe with current TOKEN (%s): %s", TOKEN[:15] + "...", exc)
+        if TOKEN != "8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo":
+            LOG.info("Falling back to valid hardcoded token 8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo...")
+            TOKEN = "8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo"
+            API = f"https://api.telegram.org/bot{TOKEN}"
+            try:
+                BOT_USERNAME = (tg("getMe") or {}).get("username", "your_bot")
+            except Exception as e2:
+                LOG.critical("Bot token is completely unauthorized: %s", e2)
+                raise e2
+        else:
+            raise exc
+
+    threading.Thread(target=backup_loop, daemon=True, name="mongodb-backup").start()
+    threading.Thread(target=self_ping_loop, daemon=True, name="self-keepalive").start()
+    threading.Thread(target=daily_watchlist_checker_loop, daemon=True, name="daily-watchlist-worker").start()
+    
+    tg("deleteWebhook", {"drop_pending_updates": False})
     LOG.info("⚡ Bot live as @%s", BOT_USERNAME)
     threading.Thread(target=bot_watchdog, daemon=True, name="bot-watchdog").start()
     
