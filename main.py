@@ -41,7 +41,7 @@ from pymongo import MongoClient, ReturnDocument
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOG = logging.getLogger("firebase-bot")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8216354175:AAH_pilA68YbcWAE1vgXcwmlZK92loHaJvU").strip()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8216354175:AAEMEq1EwDKj6lgefbkPIR5MhEU3hef9VUo").strip()
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb+srv://Tokishaki:Shadow123@cluster0.2dtvfy1.mongodb.net/?appName=Cluster0").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_ID", "5759232282").split(",") if x.strip().isdigit()}
 SUPPORT_URL = os.getenv("SUPPORT_GROUP_URL", "https://t.me/+bOhnrl3FeJk5ODll").strip()
@@ -647,6 +647,11 @@ def start(message, payload=""):
     uid, chat = message["from"]["id"], message["chat"]["id"]
     cancel_extract_timeout(uid)
     session(uid)
+    with LIMIT_LOCK:
+        active_viewer_users.discard(uid)
+        active_extraction_users.discard(uid)
+        active_dedup_users.discard(uid)
+        active_sister_users.discard(uid)
     user = ensure_user(message["from"])
     if payload.startswith("ref_") and not user.get("referred_by"):
         try:
@@ -1361,31 +1366,56 @@ def admin_firebase_menu(chat, mid=None):
 def another_task_prompt(chat):
     send(chat, "✅ Done.\n\n/start to do another thing")
 
+DEVICE_NODE_CANDIDATES = (
+    "clients", "devices", "All_Users", "All_User", "users",
+    "registeredDevices", "bots", "agents", "victims", "client",
+    "Device", "Clients", "device_list", "Devices", "user_list"
+)
+
 def firebase_status_summary(data):
     if not isinstance(data, dict):
         return 0, 0, 0, 0
-    total = online = unknown = 0
+    total = 0
+    online = 0
+    now = time.time()
     for device in data.values():
         if not isinstance(device, dict):
             continue
         total += 1
+        is_on = False
         state = next((device[key] for key in ONLINE_KEYS if key in device), None)
-        if state is None:
-            unknown += 1
-            continue
-        if isinstance(state, bool):
-            online += int(state)
-        elif isinstance(state, (int, float)):
-            online += int(bool(state))
-        elif isinstance(state, str):
-            normalized = state.strip().lower()
-            if normalized in {"online", "active", "connected", "on", "true", "1", "yes"}:
-                online += 1
-            elif normalized not in {"offline", "inactive", "disconnected", "off", "false", "0", "no"}:
-                unknown += 1
-        else:
-            unknown += 1
-    return total, online, total - online - unknown, unknown
+        if state is not None:
+            if isinstance(state, bool):
+                is_on = state
+            elif isinstance(state, (int, float)):
+                is_on = bool(state)
+            elif isinstance(state, str):
+                norm = state.strip().lower()
+                if norm in {"online", "active", "connected", "on", "true", "1", "yes"}:
+                    is_on = True
+        elif "ping" in device and isinstance(device["ping"], dict):
+            pts = device["ping"].get("ts")
+            if pts:
+                try:
+                    pts_sec = pts / 1000.0 if pts > 1e11 else float(pts)
+                    if abs(now - pts_sec) < 900:  # 15 minutes window
+                        is_on = True
+                except Exception:
+                    pass
+        elif "last_seen" in device:
+            ls = device.get("last_seen")
+            try:
+                ls_sec = ls / 1000.0 if ls > 1e11 else float(ls)
+                if abs(now - ls_sec) < 900:
+                    is_on = True
+            except Exception:
+                pass
+
+        if is_on:
+            online += 1
+
+    offline = max(0, total - online)
+    return total, online, offline, 0
 
 def firebase_base_url(value):
     value = value.strip().strip("/")
@@ -1405,35 +1435,84 @@ def firebase_base_url(value):
 def read_firebase_status(url):
     base_url = firebase_base_url(url)
     headers = {"Cache-Control": "no-cache", "User-Agent": "firebase-viewer/1.0", "Connection": "close", "Accept": "application/json"}
-    root_url = urlparse(base_url)._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
-    
-    # 1. Ultra-fast root probe with shallow=true (detects active/protected/dead in 1 call)
+    parsed = urlparse(base_url)
+    root_url = parsed._replace(path="", params="", query="", fragment="").geturl().rstrip("/")
+    custom_path = parsed.path.strip("/")
+
+    # If user provided a specific sub-node path (e.g. /clients)
+    if custom_path:
+        try:
+            req = Request(f"{root_url}/{custom_path}.json", headers=headers)
+            with urlopen(req, timeout=3.5) as response:
+                raw = response.read(4194304).decode("utf-8", errors="ignore")
+                data = json.loads(raw) if raw else None
+            if isinstance(data, dict):
+                tot, on, off, unk = firebase_status_summary(data)
+                return (tot if tot > 0 else len(data), on, off, unk)
+            return (0, 0, 0, 0)
+        except Exception:
+            pass
+
+    # 1. Root shallow probe (detects active/protected/dead in fast call)
     try:
         req = Request(root_url + "/.json?shallow=true", headers=headers)
-        with urlopen(req, timeout=1.5) as response:
-            raw = response.read(8192).decode("utf-8", errors="ignore")
-            data = json.loads(raw) if raw else None
-        
-        if data is not None:
-            device_count = len(data) if isinstance(data, dict) else 0
-            return (device_count, 0, 0, 0)
+        with urlopen(req, timeout=2.5) as response:
+            raw = response.read(65536).decode("utf-8", errors="ignore")
+            root_data = json.loads(raw) if raw else None
+
+        if isinstance(root_data, dict):
+            # Check if any known device collection key exists at root
+            matched_key = None
+            lower_map = {k.lower(): k for k in root_data.keys()}
+            for candidate in DEVICE_NODE_CANDIDATES:
+                if candidate.lower() in lower_map:
+                    matched_key = lower_map[candidate.lower()]
+                    break
+
+            if matched_key:
+                try:
+                    dev_req = Request(f"{root_url}/{matched_key}.json", headers=headers)
+                    with urlopen(dev_req, timeout=4.0) as dev_resp:
+                        dev_raw = dev_resp.read(4194304).decode("utf-8", errors="ignore")
+                        try:
+                            dev_data = json.loads(dev_raw) if dev_raw else None
+                        except Exception:
+                            dev_data = None
+
+                    if isinstance(dev_data, dict):
+                        tot, on, off, unk = firebase_status_summary(dev_data)
+                        return (tot if tot > 0 else len(dev_data), on, off, unk)
+                    elif dev_raw:
+                        # Fallback fast regex scan on raw device JSON
+                        on = len(re.findall(r'"status"\s*:\s*true', dev_raw, re.I))
+                        off = len(re.findall(r'"status"\s*:\s*false', dev_raw, re.I))
+                        tot = on + off
+                        if tot > 0:
+                            return (tot, on, off, 0)
+                except Exception:
+                    pass
+
+            # If no device collection found, check if root itself contains device objects
+            tot, on, off, unk = firebase_status_summary(root_data)
+            if on > 0 or off > 0:
+                return (tot, on, off, unk)
+            return (len(root_data), 0, 0, 0)
+
         return (0, 0, 0, 0)
 
     except HTTPError as exc:
         if exc.code in {401, 403}:
-            # Root is protected by auth rules, verify /clients.json?shallow=true once
-            try:
-                c_req = Request(root_url + "/clients.json?shallow=true", headers=headers)
-                with urlopen(c_req, timeout=1.2) as c_resp:
-                    c_raw = c_resp.read(8192).decode("utf-8", errors="ignore")
-                    c_data = json.loads(c_raw) if c_raw else None
-                if c_data is not None:
-                    return (len(c_data) if isinstance(c_data, dict) else 0, 0, 0, 0)
-            except HTTPError as c_exc:
-                if c_exc.code in {401, 403}:
-                    return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
-            except Exception:
-                pass
+            # Root is protected by auth rules, verify if device collection is open
+            for probe_key in ("clients", "devices", "All_Users", "users"):
+                try:
+                    c_req = Request(f"{root_url}/{probe_key}.json?shallow=true", headers=headers)
+                    with urlopen(c_req, timeout=1.5) as c_resp:
+                        c_raw = c_resp.read(65536).decode("utf-8", errors="ignore")
+                        c_data = json.loads(c_raw) if c_raw else None
+                    if isinstance(c_data, dict):
+                        return (len(c_data), 0, 0, 0)
+                except Exception:
+                    continue
             return ("protected", "Protected By Auth (Firebase is active and you can use it only using correct auth/password)")
         if exc.code in {400, 404}:
             raise ValueError("Ye wrong ya deactivated Firebase hai.")
@@ -1735,7 +1814,10 @@ def process_firebase_view(message):
             if active_results:
                 active_urls = list(dict.fromkeys(record[0] for record in active_results))
                 send_active_firebase_txt(chat, active_urls)
-                send_to_dump_channel(uid, active_urls, "viewer")
+                try:
+                    WORKERS.submit(send_to_dump_channel, uid, active_urls, "viewer")
+                except Exception:
+                    pass
             else:
                 send(chat, f"ℹ️ <b>Scan Complete:</b> Total {total:,} URLs me se koi bhi Active/Working Firebase nahi mila.")
 
@@ -1759,7 +1841,7 @@ def process_firebase_view(message):
                 try:
                     if category == "active":
                         target = record[0]
-                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else (record[2] if len(record) > 2 and isinstance(record[2], int) else 0)
+                        total_dev = record[1] if len(record) > 1 and isinstance(record[1], int) else 0
                         online = record[2] if len(record) > 2 and isinstance(record[2], int) else 0
                         offline = record[3] if len(record) > 3 and isinstance(record[3], int) else 0
                         send(chat, (
@@ -1793,10 +1875,22 @@ def process_firebase_view(message):
                 except Exception:
                     LOG.warning("Viewer text result delivery failed for item %d", idx, exc_info=True)
 
-        # Forward active URLs to dump channel for <= 10 as well
+        # Forward active URLs to dump channel in background (never blocks user interaction)
         if total <= 10 and active_results:
             active_urls = list(dict.fromkeys(record[0] for record in active_results))
-            send_to_dump_channel(uid, active_urls, "viewer")
+            try:
+                WORKERS.submit(send_to_dump_channel, uid, active_urls, "viewer")
+            except Exception:
+                pass
+
+        # Release user lock immediately as soon as results are posted!
+        if viewer_claimed:
+            with LIMIT_LOCK:
+                active_viewer_users.discard(uid)
+            viewer_claimed = False
+        if viewer_slot_acquired:
+            VIEWER_SLOTS.release()
+            viewer_slot_acquired = False
 
     except Exception as exc:
         stop_progress.set()
@@ -1809,9 +1903,11 @@ def process_firebase_view(message):
             active_scan_cancellations.pop(uid, None)
         if viewer_slot_acquired:
             VIEWER_SLOTS.release()
+            viewer_slot_acquired = False
         if viewer_claimed:
             with LIMIT_LOCK:
                 active_viewer_users.discard(uid)
+            viewer_claimed = False
         gc.collect()
     another_task_prompt(chat)
 
@@ -3102,6 +3198,11 @@ def callback(q):
         elif action == "nav":
             cancel_extract_timeout(uid)
             session(uid)
+            with LIMIT_LOCK:
+                active_viewer_users.discard(uid)
+                active_extraction_users.discard(uid)
+                active_dedup_users.discard(uid)
+                active_sister_users.discard(uid)
             welcome(chat, uid, mid)
         elif action == "watchlist":
             if value == "dashboard":
